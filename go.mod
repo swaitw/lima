@@ -13,7 +13,7 @@ require (
 	github.com/gorilla/mux v1.8.0
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/mattn/go-isatty v0.0.13
-	github.com/norouter/norouter v0.6.3
+	github.com/norouter/norouter v0.6.4
 	github.com/nxadm/tail v1.4.8
 	github.com/pkg/errors v0.9.1
 	github.com/sirupsen/logrus v1.8.1
