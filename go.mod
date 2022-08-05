@@ -5,8 +5,8 @@ go 1.16
 require (
 	github.com/AkihiroSuda/sshocker v0.1.1-0.20210510144941-56aa3c7472b0
 	github.com/alessio/shellescape v1.4.1
-	github.com/containerd/containerd v1.5.2
-	github.com/containerd/continuity v0.1.0
+	github.com/containerd/containerd v1.6.7
+	github.com/containerd/continuity v0.2.2
 	github.com/digitalocean/go-qemu v0.0.0-20210326154740-ac9e0b687001
 	github.com/diskfs/go-diskfs v1.2.0
 	github.com/docker/go-units v0.4.0
