@@ -2,43 +2,39 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
-	hostagentapi "github.com/AkihiroSuda/lima/pkg/hostagent/api"
-	"github.com/AkihiroSuda/lima/pkg/store"
-	"github.com/AkihiroSuda/lima/pkg/store/filenames"
-	"github.com/pkg/errors"
+	hostagentevents "github.com/lima-vm/lima/pkg/hostagent/events"
+	networks "github.com/lima-vm/lima/pkg/networks/reconcile"
+	"github.com/lima-vm/lima/pkg/osutil"
+	"github.com/lima-vm/lima/pkg/store"
+	"github.com/lima-vm/lima/pkg/store/filenames"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli/v2"
+	"github.com/spf13/cobra"
 )
 
-var stopCommand = &cli.Command{
-	Name:      "stop",
-	Usage:     "Stop an instance",
-	ArgsUsage: "INSTANCE [INSTANCE, ...]",
-	Flags: []cli.Flag{
-		&cli.BoolFlag{
-			Name:    "force",
-			Aliases: []string{"f"},
-			Usage:   "forcibly kill the processes",
-		},
-	},
-	Action:       stopAction,
-	BashComplete: stopBashComplete,
-}
-
-func stopAction(clicontext *cli.Context) error {
-	if clicontext.NArg() > 1 {
-		return errors.Errorf("too many arguments")
+func newStopCommand() *cobra.Command {
+	var stopCmd = &cobra.Command{
+		Use:               "stop INSTANCE",
+		Short:             "Stop an instance",
+		Args:              cobra.MaximumNArgs(1),
+		RunE:              stopAction,
+		ValidArgsFunction: stopBashComplete,
 	}
 
-	instName := clicontext.Args().First()
-	if instName == "" {
-		instName = DefaultInstanceName
+	stopCmd.Flags().BoolP("force", "f", false, "force stop the instance")
+	return stopCmd
+}
+
+func stopAction(cmd *cobra.Command, args []string) error {
+	instName := DefaultInstanceName
+	if len(args) > 0 {
+		instName = args[0]
 	}
 
 	inst, err := store.Inspect(instName)
@@ -46,34 +42,43 @@ func stopAction(clicontext *cli.Context) error {
 		return err
 	}
 
-	if clicontext.Bool("force") {
-		stopInstanceForcibly(inst)
-		return nil
+	force, err := cmd.Flags().GetBool("force")
+	if err != nil {
+		return err
 	}
-
-	return stopInstanceGracefully(inst)
+	if force {
+		stopInstanceForcibly(inst)
+	} else {
+		err = stopInstanceGracefully(inst)
+	}
+	// TODO: should we also reconcile networks if graceful stop returned an error?
+	if err == nil {
+		err = networks.Reconcile(cmd.Context(), "")
+	}
+	return err
 }
 
 func stopInstanceGracefully(inst *store.Instance) error {
 	if inst.Status != store.StatusRunning {
-		return errors.Errorf("expected status %q, got %q", store.StatusRunning, inst.Status)
+		return fmt.Errorf("expected status %q, got %q (maybe use `limactl stop -f`?)", store.StatusRunning, inst.Status)
 	}
 
+	begin := time.Now() // used for logrus propagation
 	logrus.Infof("Sending SIGINT to hostagent process %d", inst.HostAgentPID)
-	if err := syscall.Kill(inst.HostAgentPID, syscall.SIGINT); err != nil {
+	if err := osutil.SysKill(inst.HostAgentPID, osutil.SigInt); err != nil {
 		logrus.Error(err)
 	}
 
 	logrus.Info("Waiting for the host agent and the qemu processes to shut down")
-	return waitForHostAgentTermination(context.TODO(), inst)
+	return waitForHostAgentTermination(context.TODO(), inst, begin)
 }
 
-func waitForHostAgentTermination(ctx context.Context, inst *store.Instance) error {
+func waitForHostAgentTermination(ctx context.Context, inst *store.Instance, begin time.Time) error {
 	ctx2, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 
 	var receivedExitingEvent bool
-	onEvent := func(ev hostagentapi.Event) bool {
+	onEvent := func(ev hostagentevents.Event) bool {
 		if len(ev.Status.Errors) > 0 {
 			logrus.Errorf("%+v", ev.Status.Errors)
 		}
@@ -87,7 +92,7 @@ func waitForHostAgentTermination(ctx context.Context, inst *store.Instance) erro
 	haStdoutPath := filepath.Join(inst.Dir, filenames.HostAgentStdoutLog)
 	haStderrPath := filepath.Join(inst.Dir, filenames.HostAgentStderrLog)
 
-	if err := hostagentapi.WatchEvents(ctx2, haStdoutPath, haStderrPath, onEvent); err != nil {
+	if err := hostagentevents.Watch(ctx2, haStdoutPath, haStderrPath, begin, onEvent); err != nil {
 		return err
 	}
 
@@ -101,7 +106,7 @@ func waitForHostAgentTermination(ctx context.Context, inst *store.Instance) erro
 func stopInstanceForcibly(inst *store.Instance) {
 	if inst.QemuPID > 0 {
 		logrus.Infof("Sending SIGKILL to the QEMU process %d", inst.QemuPID)
-		if err := syscall.Kill(inst.QemuPID, syscall.SIGKILL); err != nil {
+		if err := osutil.SysKill(inst.QemuPID, osutil.SigKill); err != nil {
 			logrus.Error(err)
 		}
 	} else {
@@ -110,7 +115,7 @@ func stopInstanceForcibly(inst *store.Instance) {
 
 	if inst.HostAgentPID > 0 {
 		logrus.Infof("Sending SIGKILL to the host agent process %d", inst.HostAgentPID)
-		if err := syscall.Kill(inst.HostAgentPID, syscall.SIGKILL); err != nil {
+		if err := osutil.SysKill(inst.HostAgentPID, osutil.SigKill); err != nil {
 			logrus.Error(err)
 		}
 	} else {
@@ -134,6 +139,6 @@ func stopInstanceForcibly(inst *store.Instance) {
 	}
 }
 
-func stopBashComplete(clicontext *cli.Context) {
-	bashCompleteInstanceNames(clicontext)
+func stopBashComplete(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	return bashCompleteInstanceNames(cmd)
 }

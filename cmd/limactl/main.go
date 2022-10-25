@@ -4,64 +4,110 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 
-	"github.com/AkihiroSuda/lima/pkg/version"
+	"github.com/lima-vm/lima/pkg/store/dirnames"
+	"github.com/lima-vm/lima/pkg/version"
+	"github.com/mattn/go-isatty"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli/v2"
+	"github.com/spf13/cobra"
 )
-
-func main() {
-	if err := newApp().Run(os.Args); err != nil {
-		logrus.Fatal(err)
-	}
-}
-
-func newApp() *cli.App {
-	app := cli.NewApp()
-	app.Name = "limactl"
-	app.Usage = "Lima: Linux virtual machines"
-	app.UseShortOptionHandling = true
-	app.EnableBashCompletion = true
-	app.BashComplete = appBashComplete
-	app.Version = strings.TrimPrefix(version.Version, "v")
-	app.Flags = []cli.Flag{
-		&cli.BoolFlag{
-			Name:  "debug",
-			Usage: "debug mode",
-		},
-	}
-	app.Before = func(clicontext *cli.Context) error {
-		if clicontext.Bool("debug") {
-			logrus.SetLevel(logrus.DebugLevel)
-		}
-		if os.Geteuid() == 0 {
-			return errors.New("must not run as the root")
-		}
-		return nil
-	}
-	app.Commands = []*cli.Command{
-		startCommand,
-		stopCommand,
-		shellCommand,
-		listCommand,
-		deleteCommand,
-		validateCommand,
-		pruneCommand,
-		completionCommand,
-		hostagentCommand, // hidden
-	}
-	return app
-}
 
 const (
 	DefaultInstanceName = "default"
 )
 
-func appBashComplete(clicontext *cli.Context) {
-	w := clicontext.App.Writer
-	cli.DefaultAppComplete(clicontext)
-	for _, subcomm := range clicontext.App.Commands {
-		fmt.Fprintln(w, subcomm.Name)
+func main() {
+	if err := newApp().Execute(); err != nil {
+		handleExitCoder(err)
+		logrus.Fatal(err)
+	}
+}
+
+func newApp() *cobra.Command {
+	examplesDir := "$PREFIX/share/doc/lima/examples"
+	if exe, err := os.Executable(); err == nil {
+		binDir := filepath.Dir(exe)
+		prefixDir := filepath.Dir(binDir)
+		examplesDir = filepath.Join(prefixDir, "share/doc/lima/examples")
+	}
+
+	var rootCmd = &cobra.Command{
+		Use:     "limactl",
+		Short:   "Lima: Linux virtual machines",
+		Version: strings.TrimPrefix(version.Version, "v"),
+		Example: fmt.Sprintf(`  Start the default instance:
+  $ limactl start
+
+  Open a shell:
+  $ lima
+
+  Run a container:
+  $ lima nerdctl run -d --name nginx -p 8080:80 nginx:alpine
+
+  Stop the default instance:
+  $ limactl stop
+
+  See also example YAMLs: %s`, examplesDir),
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+	rootCmd.PersistentFlags().Bool("debug", false, "debug mode")
+	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		debug, _ := cmd.Flags().GetBool("debug")
+		if debug {
+			logrus.SetLevel(logrus.DebugLevel)
+		}
+		if runtime.GOOS == "windows" && isatty.IsCygwinTerminal(os.Stdout.Fd()) {
+			formatter := new(logrus.TextFormatter)
+			// the default setting does not recognize cygwin on windows
+			formatter.ForceColors = true
+			logrus.StandardLogger().SetFormatter(formatter)
+		}
+		if os.Geteuid() == 0 {
+			return errors.New("must not run as the root")
+		}
+		// Make sure either $HOME or $LIMA_HOME is defined, so we don't need
+		// to check for errors later
+		if _, err := dirnames.LimaDir(); err != nil {
+			return err
+		}
+		return nil
+	}
+	rootCmd.AddCommand(
+		newStartCommand(),
+		newStopCommand(),
+		newShellCommand(),
+		newCopyCommand(),
+		newListCommand(),
+		newDeleteCommand(),
+		newValidateCommand(),
+		newSudoersCommand(),
+		newPruneCommand(),
+		newHostagentCommand(),
+		newInfoCommand(),
+		newShowSSHCommand(),
+		newDebugCommand(),
+		newEditCommand(),
+		newFactoryResetCommand(),
+	)
+	return rootCmd
+}
+
+type ExitCoder interface {
+	error
+	ExitCode() int
+}
+
+func handleExitCoder(err error) {
+	if err == nil {
+		return
+	}
+
+	if exitErr, ok := err.(ExitCoder); ok {
+		os.Exit(exitErr.ExitCode())
+		return
 	}
 }

@@ -1,6 +1,8 @@
 package cidata
 
 import (
+	"io"
+	"strings"
 	"testing"
 
 	"gotest.tools/v3/assert"
@@ -14,16 +16,50 @@ func TestTemplate(t *testing.T) {
 		SSHPubKeys: []string{
 			"ssh-rsa dummy foo@example.com",
 		},
-		Mounts: []string{
-			"/Users/dummy",
-			"/Users/dummy/lima",
+		Mounts: []Mount{
+			{MountPoint: "/Users/dummy"},
+			{MountPoint: "/Users/dummy/lima"},
 		},
+		MountType: "reverse-sshfs",
 	}
-	userData, err := GenerateUserData(args)
+	layout, err := ExecuteTemplate(args)
 	assert.NilError(t, err)
-	t.Log(string(userData))
+	for _, f := range layout {
+		t.Logf("=== %q ===", f.Path)
+		b, err := io.ReadAll(f.Reader)
+		assert.NilError(t, err)
+		t.Log(string(b))
+		if f.Path == "user-data" {
+			// mounted later
+			assert.Assert(t, !strings.Contains(string(b), "mounts:"))
+		}
+	}
+}
 
-	metaData, err := GenerateMetaData(args)
+func TestTemplate9p(t *testing.T) {
+	args := TemplateArgs{
+		Name: "default",
+		User: "foo",
+		UID:  501,
+		SSHPubKeys: []string{
+			"ssh-rsa dummy foo@example.com",
+		},
+		Mounts: []Mount{
+			{Tag: "mount0", MountPoint: "/Users/dummy", Type: "9p", Options: "ro,trans=virtio"},
+			{Tag: "mount1", MountPoint: "/Users/dummy/lima", Type: "9p", Options: "rw,trans=virtio"},
+		},
+		MountType: "9p",
+	}
+	layout, err := ExecuteTemplate(args)
 	assert.NilError(t, err)
-	t.Log(string(metaData))
+	for _, f := range layout {
+		t.Logf("=== %q ===", f.Path)
+		b, err := io.ReadAll(f.Reader)
+		assert.NilError(t, err)
+		t.Log(string(b))
+		if f.Path == "user-data" {
+			// mounted at boot
+			assert.Assert(t, strings.Contains(string(b), "mounts:"))
+		}
+	}
 }

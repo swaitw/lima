@@ -1,44 +1,35 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/AkihiroSuda/lima/pkg/limayaml"
 	"github.com/containerd/containerd/identifiers"
+	"github.com/lima-vm/lima/pkg/limayaml"
+	"github.com/lima-vm/lima/pkg/store/dirnames"
 )
-
-// DotLima is a directory that appears under the home directory.
-const DotLima = ".lima"
-
-// LimaDir returns the abstract path of `~/.lima`.
-//
-// NOTE: We do not use `~/Library/Application Support/Lima` on macOS.
-// We use `~/.lima` so that we can have enough space for the length of the socket path,
-// which can be only 104 characters on macOS.
-func LimaDir() (string, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	dir := filepath.Join(homeDir, DotLima)
-	return dir, nil
-}
 
 // Instances returns the names of the instances under LimaDir.
 func Instances() ([]string, error) {
-	limaDir, err := LimaDir()
+	limaDir, err := dirnames.LimaDir()
 	if err != nil {
 		return nil, err
 	}
 	limaDirList, err := os.ReadDir(limaDir)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	var names []string
 	for _, f := range limaDirList {
 		if strings.HasPrefix(f.Name(), ".") || strings.HasPrefix(f.Name(), "_") {
+			continue
+		}
+		if !f.IsDir() {
 			continue
 		}
 		names = append(names, f.Name())
@@ -52,7 +43,7 @@ func InstanceDir(name string) (string, error) {
 	if err := identifiers.Validate(name); err != nil {
 		return "", err
 	}
-	limaDir, err := LimaDir()
+	limaDir, err := dirnames.LimaDir()
 	if err != nil {
 		return "", err
 	}
@@ -62,18 +53,20 @@ func InstanceDir(name string) (string, error) {
 
 // LoadYAMLByFilePath loads and validates the yaml.
 func LoadYAMLByFilePath(filePath string) (*limayaml.LimaYAML, error) {
-	if _, err := os.Stat(filePath); err != nil {
-		return nil, err
-	}
-	yContent, err := os.ReadFile(filePath)
+	// We need to use the absolute path because it may be used to determine hostSocket locations.
+	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return nil, err
 	}
-	y, err := limayaml.Load(yContent)
+	yContent, err := os.ReadFile(absPath)
 	if err != nil {
 		return nil, err
 	}
-	if err := limayaml.Validate(*y); err != nil {
+	y, err := limayaml.Load(yContent, absPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := limayaml.Validate(*y, false); err != nil {
 		return nil, err
 	}
 	return y, nil

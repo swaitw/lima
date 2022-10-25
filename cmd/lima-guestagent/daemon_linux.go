@@ -5,51 +5,36 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
-	"github.com/AkihiroSuda/lima/pkg/guestagent"
-	"github.com/AkihiroSuda/lima/pkg/guestagent/api/server"
 	"github.com/gorilla/mux"
+	"github.com/lima-vm/lima/pkg/guestagent"
+	"github.com/lima-vm/lima/pkg/guestagent/api/server"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli/v2"
+	"github.com/spf13/cobra"
 )
 
-var daemonCommand = &cli.Command{
-	Name:  "daemon",
-	Usage: "run the daemon",
-	Flags: []cli.Flag{
-		&cli.StringFlag{
-			Name:  "socket",
-			Usage: "socket",
-			Value: func() string {
-				if xrd := os.Getenv("XDG_RUNTIME_DIR"); xrd != "" {
-					return filepath.Join(xrd, "lima-guestagent.sock")
-				}
-				logrus.Warn("$XDG_RUNTIME_DIR is not set, cannot determine the socket name")
-				return ""
-			}(),
-		},
-		&cli.DurationFlag{
-			Name:  "tick",
-			Usage: "tick for polling events",
-			Value: 3 * time.Second,
-		},
-	},
-	Action: daemonAction,
+func newDaemonCommand() *cobra.Command {
+	daemonCommand := &cobra.Command{
+		Use:   "daemon",
+		Short: "run the daemon",
+		RunE:  daemonAction,
+	}
+	daemonCommand.Flags().Duration("tick", 3*time.Second, "tick for polling events")
+	return daemonCommand
 }
 
-func daemonAction(clicontext *cli.Context) error {
-	socket := clicontext.String("socket")
-	if socket == "" {
-		return errors.New("socket must be specified")
+func daemonAction(cmd *cobra.Command, args []string) error {
+	socket := "/run/lima-guestagent.sock"
+	tick, err := cmd.Flags().GetDuration("tick")
+	if err != nil {
+		return err
 	}
-	tick := clicontext.Duration("tick")
 	if tick == 0 {
 		return errors.New("tick must be specified")
 	}
-	if os.Geteuid() == 0 {
-		return errors.New("must not run as the root")
+	if os.Geteuid() != 0 {
+		return errors.New("must run as the root")
 	}
 	logrus.Infof("event tick: %v", tick)
 
@@ -61,19 +46,25 @@ func daemonAction(clicontext *cli.Context) error {
 		return ticker.C, ticker.Stop
 	}
 
-	agent := guestagent.New(newTicker)
+	agent, err := guestagent.New(newTicker, tick*20)
+	if err != nil {
+		return err
+	}
 	backend := &server.Backend{
 		Agent: agent,
 	}
 	r := mux.NewRouter()
 	server.AddRoutes(r, backend)
 	srv := &http.Server{Handler: r}
-	err := os.RemoveAll(socket)
+	err = os.RemoveAll(socket)
 	if err != nil {
 		return err
 	}
 	l, err := net.Listen("unix", socket)
 	if err != nil {
+		return err
+	}
+	if err := os.Chmod(socket, 0777); err != nil {
 		return err
 	}
 	logrus.Infof("serving the guest agent on %q", socket)

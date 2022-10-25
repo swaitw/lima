@@ -6,15 +6,14 @@ package httpclientutil
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
 
-	"github.com/AkihiroSuda/lima/pkg/guestagent/api"
-	"github.com/pkg/errors"
+	"github.com/lima-vm/lima/pkg/httputil"
 )
 
 // NewHTTPClientWithSocketPath creates a client.
@@ -56,12 +55,12 @@ func readAtMost(r io.Reader, maxBytes int) ([]byte, error) {
 		R: r,
 		N: int64(maxBytes),
 	}
-	b, err := ioutil.ReadAll(lr)
+	b, err := io.ReadAll(lr)
 	if err != nil {
 		return b, err
 	}
 	if lr.N == 0 {
-		return b, errors.Errorf("expected at most %d bytes, got more", maxBytes)
+		return b, fmt.Errorf("expected at most %d bytes, got more", maxBytes)
 	}
 	return b, nil
 }
@@ -78,11 +77,11 @@ type HTTPStatusError struct {
 }
 
 // Error implements error.
-// If e.Body is a marshalled string of api.ErrorJSON, Error returns ErrorJSON.Message .
+// If e.Body is a marshalled string of httputil.ErrorJSON, Error returns ErrorJSON.Message .
 // Otherwise Error returns a human-readable string that contains e.StatusCode and e.Body.
 func (e *HTTPStatusError) Error() string {
 	if e.Body != "" && len(e.Body) < HTTPStatusErrorBodyMaxLength {
-		var ej api.ErrorJSON
+		var ej httputil.ErrorJSON
 		if json.Unmarshal([]byte(e.Body), &ej) == nil {
 			return ej.Message
 		}

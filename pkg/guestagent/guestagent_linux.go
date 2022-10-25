@@ -4,20 +4,42 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"net"
 	"reflect"
+	"sync"
 	"time"
 
-	"github.com/AkihiroSuda/lima/pkg/guestagent/api"
-	"github.com/AkihiroSuda/lima/pkg/guestagent/procnettcp"
+	"github.com/elastic/go-libaudit/v2"
+	"github.com/elastic/go-libaudit/v2/auparse"
+	"github.com/lima-vm/lima/pkg/guestagent/api"
+	"github.com/lima-vm/lima/pkg/guestagent/iptables"
+	"github.com/lima-vm/lima/pkg/guestagent/procnettcp"
+	"github.com/lima-vm/lima/pkg/guestagent/timesync"
 	"github.com/sirupsen/logrus"
 	"github.com/yalue/native_endian"
 )
 
-func New(newTicker func() (<-chan time.Time, func())) Agent {
-	return &agent{
+func New(newTicker func() (<-chan time.Time, func()), iptablesIdle time.Duration) (Agent, error) {
+	a := &agent{
 		newTicker: newTicker,
 	}
+
+	auditClient, err := libaudit.NewMulticastAuditClient(nil)
+	if err != nil {
+		return nil, err
+	}
+	auditStatus, err := auditClient.GetStatus()
+	if err != nil {
+		return nil, err
+	}
+	if auditStatus.Enabled == 0 {
+		if err = auditClient.SetEnabled(true, libaudit.WaitForReply); err != nil {
+			return nil, err
+		}
+	}
+
+	go a.setWorthCheckingIPTablesRoutine(auditClient, iptablesIdle)
+	go a.fixSystemTimeSkew()
+	return a, nil
 }
 
 type agent struct {
@@ -25,6 +47,48 @@ type agent struct {
 	// We can't use inotify for /proc/net/tcp, so we need this ticker to
 	// reload /proc/net/tcp.
 	newTicker func() (<-chan time.Time, func())
+
+	worthCheckingIPTables   bool
+	worthCheckingIPTablesMu sync.RWMutex
+	latestIPTables          []iptables.Entry
+	latestIPTablesMu        sync.RWMutex
+}
+
+// setWorthCheckingIPTablesRoutine sets worthCheckingIPTables to be true
+// when received NETFILTER_CFG audit message.
+//
+// setWorthCheckingIPTablesRoutine sets worthCheckingIPTables to be false
+// when no NETFILTER_CFG audit message was received for the iptablesIdle time.
+func (a *agent) setWorthCheckingIPTablesRoutine(auditClient *libaudit.AuditClient, iptablesIdle time.Duration) {
+	var latestTrue time.Time
+	go func() {
+		for {
+			time.Sleep(iptablesIdle)
+			a.worthCheckingIPTablesMu.Lock()
+			// time is monotonic, see https://pkg.go.dev/time#hdr-Monotonic_Clocks
+			elapsedSinceLastTrue := time.Since(latestTrue)
+			if elapsedSinceLastTrue >= iptablesIdle {
+				logrus.Debug("setWorthCheckingIPTablesRoutine(): setting to false")
+				a.worthCheckingIPTables = false
+			}
+			a.worthCheckingIPTablesMu.Unlock()
+		}
+	}()
+	for {
+		msg, err := auditClient.Receive(false)
+		if err != nil {
+			logrus.Error(err)
+			continue
+		}
+		switch msg.Type {
+		case auparse.AUDIT_NETFILTER_CFG:
+			a.worthCheckingIPTablesMu.Lock()
+			logrus.Debug("setWorthCheckingIPTablesRoutine(): setting to true")
+			a.worthCheckingIPTables = true
+			latestTrue = time.Now()
+			a.worthCheckingIPTablesMu.Unlock()
+		}
+	}
 }
 
 type eventState struct {
@@ -116,18 +180,13 @@ func (a *agent) LocalPorts(ctx context.Context) ([]api.IPPort, error) {
 		return res, err
 	}
 
-	ipv4Loopback1 := net.ParseIP("127.0.0.1")
 	for _, f := range tcpParsed {
 		switch f.Kind {
 		case procnettcp.TCP, procnettcp.TCP6:
 		default:
 			continue
 		}
-		isListen := f.State == procnettcp.TCPListen
-		// We do NOT use net.IP.IsLoopback() here, because we want to exclude addresses like 127.0.0.53 here.
-		isLocal := f.IP.Equal(net.IPv4zero) || f.IP.Equal(net.IPv6zero) ||
-			f.IP.Equal(ipv4Loopback1) || f.IP.Equal(net.IPv6loopback)
-		if isListen && isLocal {
+		if f.State == procnettcp.TCPListen {
 			res = append(res,
 				api.IPPort{
 					IP:   f.IP,
@@ -135,6 +194,44 @@ func (a *agent) LocalPorts(ctx context.Context) ([]api.IPPort, error) {
 				})
 		}
 	}
+
+	a.worthCheckingIPTablesMu.RLock()
+	worthCheckingIPTables := a.worthCheckingIPTables
+	a.worthCheckingIPTablesMu.RUnlock()
+	logrus.Debugf("LocalPorts(): worthCheckingIPTables=%v", worthCheckingIPTables)
+
+	var ipts []iptables.Entry
+	if a.worthCheckingIPTables {
+		ipts, err = iptables.GetPorts()
+		if err != nil {
+			return res, err
+		}
+		a.latestIPTablesMu.Lock()
+		a.latestIPTables = ipts
+		a.latestIPTablesMu.Unlock()
+	} else {
+		a.latestIPTablesMu.RLock()
+		ipts = a.latestIPTables
+		a.latestIPTablesMu.RUnlock()
+	}
+
+	for _, ipt := range ipts {
+		// Make sure the port isn't already listed from procnettcp
+		found := false
+		for _, re := range res {
+			if re.Port == ipt.Port {
+				found = true
+			}
+		}
+		if !found {
+			res = append(res,
+				api.IPPort{
+					IP:   ipt.IP,
+					Port: ipt.Port,
+				})
+		}
+	}
+
 	return res, nil
 }
 
@@ -148,4 +245,32 @@ func (a *agent) Info(ctx context.Context) (*api.Info, error) {
 		return nil, err
 	}
 	return &info, nil
+}
+
+const deltaLimit = 2 * time.Second
+
+func (a *agent) fixSystemTimeSkew() {
+	for {
+		ticker := time.NewTicker(10 * time.Second)
+		for now := range ticker.C {
+			rtc, err := timesync.GetRTCTime()
+			if err != nil {
+				logrus.Warnf("fixSystemTimeSkew: lookup error: %s", err.Error())
+				continue
+			}
+			d := rtc.Sub(now)
+			logrus.Debugf("fixSystemTimeSkew: rtc=%s systime=%s delta=%s",
+				rtc.Format(time.RFC3339), now.Format(time.RFC3339), d)
+			if d > deltaLimit || d < -deltaLimit {
+				err = timesync.SetSystemTime(rtc)
+				if err != nil {
+					logrus.Warnf("fixSystemTimeSkew: set system clock error: %s", err.Error())
+					continue
+				}
+				logrus.Infof("fixSystemTimeSkew: system time synchronized with rtc")
+				break
+			}
+		}
+		ticker.Stop()
+	}
 }

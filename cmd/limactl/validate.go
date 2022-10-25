@@ -1,30 +1,32 @@
 package main
 
 import (
-	"github.com/AkihiroSuda/lima/pkg/store"
-	"github.com/pkg/errors"
+	"fmt"
+
+	"github.com/lima-vm/lima/cmd/limactl/guessarg"
+	"github.com/lima-vm/lima/pkg/store"
+	"github.com/spf13/cobra"
+
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli/v2"
 )
 
-var validateCommand = &cli.Command{
-	Name:      "validate",
-	Usage:     "Validate yaml files",
-	ArgsUsage: "FILE.yaml [FILE.yaml, ...]",
-	Action:    validateAction,
+func newValidateCommand() *cobra.Command {
+	var validateCommand = &cobra.Command{
+		Use:   "validate FILE.yaml [FILE.yaml, ...]",
+		Short: "Validate YAML files",
+		Args:  cobra.MinimumNArgs(1),
+		RunE:  validateAction,
+	}
+	return validateCommand
 }
 
-func validateAction(clicontext *cli.Context) error {
-	if clicontext.NArg() == 0 {
-		return errors.Errorf("requires at least 1 argument")
-	}
-
-	for _, f := range clicontext.Args().Slice() {
+func validateAction(cmd *cobra.Command, args []string) error {
+	for _, f := range args {
 		_, err := store.LoadYAMLByFilePath(f)
 		if err != nil {
-			return errors.Wrapf(err, "failed to load YAML file %q", f)
+			return fmt.Errorf("failed to load YAML file %q: %w", f, err)
 		}
-		if _, err := instNameFromYAMLPath(f); err != nil {
+		if _, err := guessarg.InstNameFromYAMLPath(f); err != nil {
 			return err
 		}
 		logrus.Infof("%q: OK", f)

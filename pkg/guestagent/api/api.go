@@ -6,10 +6,9 @@ import (
 	"time"
 )
 
-// ErrorJSON is returned with "application/json" content type and non-2XX status code
-type ErrorJSON struct {
-	Message string `json:"message"`
-}
+var (
+	IPv4loopback1 = net.IPv4(127, 0, 0, 1)
+)
 
 type IPPort struct {
 	IP   net.IP `json:"ip"`

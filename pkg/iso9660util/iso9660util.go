@@ -2,12 +2,15 @@ package iso9660util
 
 import (
 	"io"
+	"io/ioutil"
 	"os"
-	"strings"
+	"path"
+	"path/filepath"
+	"runtime"
 
 	"github.com/diskfs/go-diskfs/filesystem"
 	"github.com/diskfs/go-diskfs/filesystem/iso9660"
-	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type Entry struct {
@@ -27,7 +30,17 @@ func Write(isoPath, label string, layout []Entry) error {
 
 	defer isoFile.Close()
 
-	fs, err := iso9660.Create(isoFile, 0, 0, 0, "")
+	workdir, err := ioutil.TempDir("", "diskfs_iso")
+	if err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		// go-embed unfortunately needs unix path
+		workdir = filepath.ToSlash(workdir)
+	}
+	logrus.Debugf("Creating iso file %s", isoFile.Name())
+	logrus.Debugf("Using %s as workspace", workdir)
+	fs, err := iso9660.Create(isoFile, 0, 0, 0, workdir)
 	if err != nil {
 		return err
 	}
@@ -49,11 +62,13 @@ func Write(isoPath, label string, layout []Entry) error {
 	return isoFile.Close()
 }
 
-func WriteFile(fs filesystem.FileSystem, path string, r io.Reader) (int64, error) {
-	if strings.Contains(path, "/") || strings.Contains(path, "\\") {
-		return 0, errors.Errorf("directory not supported yet: %q", path)
+func WriteFile(fs filesystem.FileSystem, pathStr string, r io.Reader) (int64, error) {
+	if dir := path.Dir(pathStr); dir != "" && dir != "/" {
+		if err := fs.Mkdir(dir); err != nil {
+			return 0, err
+		}
 	}
-	f, err := fs.OpenFile(path, os.O_CREATE|os.O_RDWR)
+	f, err := fs.OpenFile(pathStr, os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return 0, err
 	}

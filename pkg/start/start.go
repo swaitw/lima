@@ -1,28 +1,27 @@
 package start
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"text/template"
 	"time"
 
-	"github.com/AkihiroSuda/lima/pkg/cidata"
-	hostagentapi "github.com/AkihiroSuda/lima/pkg/hostagent/api"
-	"github.com/AkihiroSuda/lima/pkg/limayaml"
-	"github.com/AkihiroSuda/lima/pkg/qemu"
-	"github.com/AkihiroSuda/lima/pkg/store"
-	"github.com/AkihiroSuda/lima/pkg/store/filenames"
-	"github.com/pkg/errors"
+	"github.com/lima-vm/lima/pkg/downloader"
+	hostagentevents "github.com/lima-vm/lima/pkg/hostagent/events"
+	"github.com/lima-vm/lima/pkg/limayaml"
+	"github.com/lima-vm/lima/pkg/qemu"
+	"github.com/lima-vm/lima/pkg/store"
+	"github.com/lima-vm/lima/pkg/store/filenames"
 	"github.com/sirupsen/logrus"
 )
 
 func ensureDisk(ctx context.Context, instName, instDir string, y *limayaml.LimaYAML) error {
-	cidataISOPath := filepath.Join(instDir, filenames.CIDataISO)
-	if err := cidata.GenerateISO9660(cidataISOPath, instName, y); err != nil {
-		return err
-	}
 	qCfg := qemu.Config{
 		Name:        instName,
 		InstanceDir: instDir,
@@ -35,11 +34,56 @@ func ensureDisk(ctx context.Context, instName, instDir string, y *limayaml.LimaY
 	return nil
 }
 
+// ensureNerdctlArchiveCache prefetches the nerdctl-full-VERSION-linux-GOARCH.tar.gz archive
+// into the cache before launching the hostagent process, so that we can show the progress in tty.
+// https://github.com/lima-vm/lima/issues/326
+func ensureNerdctlArchiveCache(y *limayaml.LimaYAML) (string, error) {
+	if !*y.Containerd.System && !*y.Containerd.User {
+		// nerdctl archive is not needed
+		return "", nil
+	}
+
+	errs := make([]error, len(y.Containerd.Archives))
+	for i := range y.Containerd.Archives {
+		f := &y.Containerd.Archives[i]
+		if f.Arch != *y.Arch {
+			errs[i] = fmt.Errorf("unsupported arch: %q", f.Arch)
+			continue
+		}
+		logrus.WithField("digest", f.Digest).Infof("Attempting to download the nerdctl archive from %q", f.Location)
+		res, err := downloader.Download("", f.Location, downloader.WithCache(), downloader.WithExpectedDigest(f.Digest))
+		if err != nil {
+			errs[i] = fmt.Errorf("failed to download %q: %w", f.Location, err)
+			continue
+		}
+		switch res.Status {
+		case downloader.StatusDownloaded:
+			logrus.Infof("Downloaded the nerdctl archive from %q", f.Location)
+		case downloader.StatusUsedCache:
+			logrus.Infof("Using cache %q", res.CachePath)
+		default:
+			logrus.Warnf("Unexpected result from downloader.Download(): %+v", res)
+		}
+		if res.CachePath == "" {
+			if downloader.IsLocal(f.Location) {
+				return f.Location, nil
+			}
+			return "", fmt.Errorf("cache did not contain %q", f.Location)
+		}
+		return res.CachePath, nil
+	}
+
+	return "", fmt.Errorf("failed to download the nerdctl archive, attempted %d candidates, errors=%v",
+		len(y.Containerd.Archives), errs)
+}
+
 func Start(ctx context.Context, inst *store.Instance) error {
 	haPIDPath := filepath.Join(inst.Dir, filenames.HostAgentPID)
 	if _, err := os.Stat(haPIDPath); !errors.Is(err, os.ErrNotExist) {
-		return errors.Errorf("instance %q seems running (hint: remove %q if the instance is not actually running)", inst.Name, haPIDPath)
+		return fmt.Errorf("instance %q seems running (hint: remove %q if the instance is not actually running)", inst.Name, haPIDPath)
 	}
+
+	haSockPath := filepath.Join(inst.Dir, filenames.HostAgentSock)
 
 	y, err := inst.LoadYAML()
 	if err != nil {
@@ -47,6 +91,10 @@ func Start(ctx context.Context, inst *store.Instance) error {
 	}
 
 	if err := ensureDisk(ctx, inst.Name, inst.Dir, y); err != nil {
+		return err
+	}
+	nerdctlArchiveCache, err := ensureNerdctlArchiveCache(y)
+	if err != nil {
 		return err
 	}
 
@@ -73,12 +121,24 @@ func Start(ctx context.Context, inst *store.Instance) error {
 	}
 	// no defer haStderrW.Close()
 
-	haCmd := exec.CommandContext(ctx, self,
+	var args []string
+	if logrus.GetLevel() >= logrus.DebugLevel {
+		args = append(args, "--debug")
+	}
+	args = append(args,
 		"hostagent",
 		"--pidfile", haPIDPath,
-		inst.Name)
+		"--socket", haSockPath)
+	if nerdctlArchiveCache != "" {
+		args = append(args, "--nerdctl-archive", nerdctlArchiveCache)
+	}
+	args = append(args, inst.Name)
+	haCmd := exec.CommandContext(ctx, self, args...)
+
 	haCmd.Stdout = haStdoutW
 	haCmd.Stderr = haStderrW
+
+	begin := time.Now() // used for logrus propagation
 
 	if err := haCmd.Start(); err != nil {
 		return err
@@ -88,8 +148,26 @@ func Start(ctx context.Context, inst *store.Instance) error {
 		return err
 	}
 
-	return watchHostAgentEvents(ctx, inst.Name, haStdoutPath, haStderrPath)
-	// leave the hostagent process running
+	watchErrCh := make(chan error)
+	go func() {
+		watchErrCh <- watchHostAgentEvents(ctx, inst, haStdoutPath, haStderrPath, begin)
+		close(watchErrCh)
+	}()
+	waitErrCh := make(chan error)
+	go func() {
+		waitErrCh <- haCmd.Wait()
+		close(waitErrCh)
+	}()
+
+	select {
+	case watchErr := <-watchErrCh:
+		// watchErr can be nil
+		return watchErr
+		// leave the hostagent process running
+	case waitErr := <-waitErrCh:
+		// waitErr should not be nil
+		return fmt.Errorf("host agent process has exited: %w", waitErr)
+	}
 }
 
 func waitHostAgentStart(ctx context.Context, haPIDPath, haStderrPath string) error {
@@ -101,12 +179,12 @@ func waitHostAgentStart(ctx context.Context, haPIDPath, haStderrPath string) err
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return errors.Errorf("hostagent (%q) did not start up in %v (hint: see %q)", haPIDPath, deadlineDuration, haStderrPath)
+			return fmt.Errorf("hostagent (%q) did not start up in %v (hint: see %q)", haPIDPath, deadlineDuration, haStderrPath)
 		}
 	}
 }
 
-func watchHostAgentEvents(ctx context.Context, instName, haStdoutPath, haStderrPath string) error {
+func watchHostAgentEvents(ctx context.Context, inst *store.Instance, haStdoutPath, haStderrPath string, begin time.Time) error {
 	ctx2, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
@@ -115,7 +193,7 @@ func watchHostAgentEvents(ctx context.Context, instName, haStdoutPath, haStderrP
 		receivedRunningEvent bool
 		err                  error
 	)
-	onEvent := func(ev hostagentapi.Event) bool {
+	onEvent := func(ev hostagentevents.Event) bool {
 		if !printedSSHLocalPort && ev.Status.SSHLocalPort != 0 {
 			logrus.Infof("SSH Local Port: %d", ev.Status.SSHLocalPort)
 			printedSSHLocalPort = true
@@ -125,24 +203,25 @@ func watchHostAgentEvents(ctx context.Context, instName, haStdoutPath, haStderrP
 			logrus.Errorf("%+v", ev.Status.Errors)
 		}
 		if ev.Status.Exiting {
-			err = errors.Errorf("exiting, status=%+v (hint: see %q)", ev.Status, haStderrPath)
+			err = fmt.Errorf("exiting, status=%+v (hint: see %q)", ev.Status, haStderrPath)
 			return true
 		} else if ev.Status.Running {
 			receivedRunningEvent = true
 			if ev.Status.Degraded {
 				logrus.Warnf("DEGRADED. The VM seems running, but file sharing and port forwarding may not work. (hint: see %q)", haStderrPath)
-				err = errors.Errorf("degraded, status=%+v", ev.Status)
+				err = fmt.Errorf("degraded, status=%+v", ev.Status)
 				return true
 			}
 
-			logrus.Infof("READY. Run `%s` to open the shell.", LimactlShellCmd(instName))
+			logrus.Infof("READY. Run `%s` to open the shell.", LimactlShellCmd(inst.Name))
+			ShowMessage(inst)
 			err = nil
 			return true
 		}
 		return false
 	}
 
-	if xerr := hostagentapi.WatchEvents(ctx2, haStdoutPath, haStderrPath, onEvent); xerr != nil {
+	if xerr := hostagentevents.Watch(ctx2, haStdoutPath, haStderrPath, begin, onEvent); xerr != nil {
 		return xerr
 	}
 
@@ -163,4 +242,32 @@ func LimactlShellCmd(instName string) string {
 		shellCmd = "lima"
 	}
 	return shellCmd
+}
+
+func ShowMessage(inst *store.Instance) error {
+	if inst.Message == "" {
+		return nil
+	}
+	t, err := template.New("message").Parse(inst.Message)
+	if err != nil {
+		return err
+	}
+	data, err := store.AddGlobalFields(inst)
+	if err != nil {
+		return err
+	}
+	var b bytes.Buffer
+	if err := t.Execute(&b, data); err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(&b)
+	logrus.Infof("Message from the instance %q:", inst.Name)
+	for scanner.Scan() {
+		// Avoid prepending logrus "INFO" header, for ease of copypasting
+		fmt.Println(scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return nil
 }

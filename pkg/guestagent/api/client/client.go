@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/AkihiroSuda/lima/pkg/guestagent/api"
-	"github.com/AkihiroSuda/lima/pkg/httpclientutil"
+	"github.com/lima-vm/lima/pkg/guestagent/api"
+	"github.com/lima-vm/lima/pkg/httpclientutil"
 )
 
 type GuestAgentClient interface {
@@ -71,9 +71,9 @@ func (c *client) Events(ctx context.Context, onEvent func(api.Event)) error {
 		return err
 	}
 	defer resp.Body.Close()
-	var ev api.Event
 	dec := json.NewDecoder(resp.Body)
 	for {
+		var ev api.Event
 		if err := dec.Decode(&ev); err != nil {
 			return err
 		}
