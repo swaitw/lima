@@ -1,72 +1,86 @@
 package hostagent
 
 import (
-	"context"
+	"errors"
+	"fmt"
 	"os"
 
-	"github.com/AkihiroSuda/lima/pkg/limayaml"
-	"github.com/AkihiroSuda/lima/pkg/localpathutil"
-	"github.com/AkihiroSuda/sshocker/pkg/reversesshfs"
-	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
+	"github.com/lima-vm/lima/pkg/limayaml"
+	"github.com/lima-vm/lima/pkg/localpathutil"
+	"github.com/lima-vm/sshocker/pkg/reversesshfs"
+	"github.com/sirupsen/logrus"
 )
 
 type mount struct {
 	close func() error
 }
 
-func (a *HostAgent) setupMounts(ctx context.Context) ([]*mount, error) {
+func (a *HostAgent) setupMounts() ([]*mount, error) {
 	var (
 		res  []*mount
-		mErr error
+		errs []error
 	)
-	for _, f := range a.y.Mounts {
-		m, err := a.setupMount(ctx, f)
+	for _, f := range a.instConfig.Mounts {
+		m, err := a.setupMount(f)
 		if err != nil {
-			mErr = multierror.Append(mErr, err)
+			errs = append(errs, err)
 			continue
 		}
 		res = append(res, m)
 	}
-	return res, mErr
+	return res, errors.Join(errs...)
 }
 
-func (a *HostAgent) setupMount(ctx context.Context, m limayaml.Mount) (*mount, error) {
-	expanded, err := localpathutil.Expand(m.Location)
+func (a *HostAgent) setupMount(m limayaml.Mount) (*mount, error) {
+	location, err := localpathutil.Expand(m.Location)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(expanded, 0755); err != nil {
+
+	mountPoint, err := localpathutil.Expand(*m.MountPoint)
+	if err != nil {
 		return nil, err
 	}
-	a.l.Infof("Mounting %q", expanded)
+	if err := os.MkdirAll(location, 0o755); err != nil {
+		return nil, err
+	}
+	// NOTE: allow_other requires "user_allow_other" in /etc/fuse.conf
+	sshfsOptions := "allow_other"
+	if !*m.SSHFS.Cache {
+		sshfsOptions += ",cache=no"
+	}
+	if *m.SSHFS.FollowSymlinks {
+		sshfsOptions += ",follow_symlinks"
+	}
+	logrus.Infof("Mounting %q on %q", location, mountPoint)
+
 	rsf := &reversesshfs.ReverseSSHFS{
-		SSHConfig:  a.sshConfig,
-		LocalPath:  expanded,
-		Host:       "127.0.0.1",
-		Port:       a.y.SSH.LocalPort,
-		RemotePath: expanded,
-		Readonly:   !m.Writable,
-		// NOTE: allow_root requires "user_allow_other" in /etc/fuse.conf
-		SSHFSAdditionalArgs: []string{"-o", "allow_root"},
+		Driver:              *m.SSHFS.SFTPDriver,
+		SSHConfig:           a.sshConfig,
+		LocalPath:           location,
+		Host:                "127.0.0.1",
+		Port:                a.sshLocalPort,
+		RemotePath:          mountPoint,
+		Readonly:            !(*m.Writable),
+		SSHFSAdditionalArgs: []string{"-o", sshfsOptions},
 	}
 	if err := rsf.Prepare(); err != nil {
-		return nil, errors.Wrapf(err, "failed to prepare reverse sshfs for %q", expanded)
+		return nil, fmt.Errorf("failed to prepare reverse sshfs for %q on %q: %w", location, mountPoint, err)
 	}
 	if err := rsf.Start(); err != nil {
-		a.l.WithError(err).Warnf("failed to mount reverse sshfs for %q, retrying with `-o nonempty`", expanded)
+		logrus.WithError(err).Warnf("failed to mount reverse sshfs for %q on %q, retrying with `-o nonempty`", location, mountPoint)
 		// NOTE: nonempty is not supported for libfuse3: https://github.com/canonical/multipass/issues/1381
 		rsf.SSHFSAdditionalArgs = []string{"-o", "nonempty"}
 		if err := rsf.Start(); err != nil {
-			return nil, errors.Wrapf(err, "failed to mount reverse sshfs for %q", expanded)
+			return nil, fmt.Errorf("failed to mount reverse sshfs for %q on %q: %w", location, mountPoint, err)
 		}
 	}
 
 	res := &mount{
 		close: func() error {
-			a.l.Infof("Unmounting %q", expanded)
+			logrus.Infof("Unmounting %q", location)
 			if closeErr := rsf.Close(); closeErr != nil {
-				return errors.Wrapf(err, "failed to unmount reverse sshfs for %q", expanded)
+				return fmt.Errorf("failed to unmount reverse sshfs for %q on %q: %w", location, mountPoint, err)
 			}
 			return nil
 		},

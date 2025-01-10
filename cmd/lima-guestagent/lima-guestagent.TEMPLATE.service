@@ -2,9 +2,11 @@
 Description=lima-guestagent
 
 [Service]
-ExecStart={{.Binary}} daemon
+ExecStart={{.Binary}} daemon {{.Args}}
 Type=simple
 Restart=on-failure
+OOMPolicy=continue
+OOMScoreAdjust=-500
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

@@ -2,66 +2,113 @@ package hostagent
 
 import (
 	"context"
-	"strconv"
+	"net"
 
-	"github.com/AkihiroSuda/lima/pkg/guestagent/api"
-	"github.com/AkihiroSuda/sshocker/pkg/ssh"
+	"github.com/lima-vm/lima/pkg/guestagent/api"
+	"github.com/lima-vm/lima/pkg/limayaml"
+	"github.com/lima-vm/sshocker/pkg/ssh"
 	"github.com/sirupsen/logrus"
 )
 
 type portForwarder struct {
-	l           *logrus.Logger
 	sshConfig   *ssh.SSHConfig
 	sshHostPort int
-	tcp         map[int]struct{} // key: int (NOTE: this might be inconsistent with the actual status of SSH master)
+	rules       []limayaml.PortForward
+	ignore      bool
+	vmType      limayaml.VMType
 }
 
 const sshGuestPort = 22
 
-func newPortForwarder(l *logrus.Logger, sshConfig *ssh.SSHConfig, sshHostPort int) *portForwarder {
+var IPv4loopback1 = limayaml.IPv4loopback1
+
+func newPortForwarder(sshConfig *ssh.SSHConfig, sshHostPort int, rules []limayaml.PortForward, ignore bool, vmType limayaml.VMType) *portForwarder {
 	return &portForwarder{
-		l:           l,
 		sshConfig:   sshConfig,
 		sshHostPort: sshHostPort,
-		tcp:         make(map[int]struct{}),
+		rules:       rules,
+		ignore:      ignore,
+		vmType:      vmType,
 	}
 }
 
-func (pf *portForwarder) OnEvent(ctx context.Context, ev api.Event) {
-	ignore := func(x api.IPPort) bool {
-		switch x.Port {
-		case sshGuestPort, pf.sshHostPort:
-			return true
-		default:
-			return false
-		}
+func hostAddress(rule limayaml.PortForward, guest *api.IPPort) string {
+	if rule.HostSocket != "" {
+		return rule.HostSocket
 	}
-	for _, f := range ev.LocalPortsRemoved {
-		if ignore(f) {
+	host := &api.IPPort{Ip: rule.HostIP.String()}
+	if guest.Port == 0 {
+		// guest is a socket
+		host.Port = int32(rule.HostPort)
+	} else {
+		host.Port = guest.Port + int32(rule.HostPortRange[0]-rule.GuestPortRange[0])
+	}
+	return host.HostString()
+}
+
+func (pf *portForwarder) forwardingAddresses(guest *api.IPPort) (hostAddr, guestAddr string) {
+	guestIP := net.ParseIP(guest.Ip)
+	for _, rule := range pf.rules {
+		if rule.GuestSocket != "" {
 			continue
 		}
-		// pf.tcp might be inconsistent with the actual state of the SSH master,
-		// so we always attempt to cancel forwarding, even when f.Port is not tracked in pf.tcp.
-		pf.l.Infof("Stopping forwarding TCP port %d", f.Port)
-		verbCancel := true
-		if err := forwardSSH(ctx, pf.sshConfig, pf.sshHostPort, "127.0.0.1:"+strconv.Itoa(f.Port), "127.0.0.1:"+strconv.Itoa(f.Port), verbCancel); err != nil {
-			if _, ok := pf.tcp[f.Port]; ok {
-				pf.l.WithError(err).Warnf("failed to stop forwarding TCP port %d", f.Port)
-			} else {
-				pf.l.WithError(err).Debugf("failed to stop forwarding TCP port %d (negligible)", f.Port)
-			}
+		switch rule.Proto {
+		case limayaml.ProtoTCP, limayaml.ProtoAny:
+		default:
+			continue
 		}
-		delete(pf.tcp, f.Port)
+		if guest.Port < int32(rule.GuestPortRange[0]) || guest.Port > int32(rule.GuestPortRange[1]) {
+			continue
+		}
+		switch {
+		case guestIP.IsUnspecified():
+		case guestIP.Equal(rule.GuestIP):
+		case guestIP.Equal(net.IPv6loopback) && rule.GuestIP.Equal(IPv4loopback1):
+		case rule.GuestIP.IsUnspecified() && !rule.GuestIPMustBeZero:
+			// When GuestIPMustBeZero is true, then 0.0.0.0 must be an exact match, which is already
+			// handled above by the guest.IP.IsUnspecified() condition.
+		default:
+			continue
+		}
+		if rule.Ignore {
+			if guestIP.IsUnspecified() && !rule.GuestIP.IsUnspecified() {
+				continue
+			}
+			break
+		}
+		return hostAddress(rule, guest), guest.HostString()
+	}
+	return "", guest.HostString()
+}
+
+func (pf *portForwarder) OnEvent(ctx context.Context, ev *api.Event) {
+	for _, f := range ev.LocalPortsRemoved {
+		if f.Protocol != "tcp" {
+			continue
+		}
+		local, remote := pf.forwardingAddresses(f)
+		if local == "" {
+			continue
+		}
+		logrus.Infof("Stopping forwarding TCP from %s to %s", remote, local)
+		if err := forwardTCP(ctx, pf.sshConfig, pf.sshHostPort, local, remote, verbCancel); err != nil {
+			logrus.WithError(err).Warnf("failed to stop forwarding tcp port %d", f.Port)
+		}
 	}
 	for _, f := range ev.LocalPortsAdded {
-		if ignore(f) {
+		if f.Protocol != "tcp" {
 			continue
 		}
-		pf.l.Infof("Forwarding TCP port %d", f.Port)
-		if err := forwardSSH(ctx, pf.sshConfig, pf.sshHostPort, "127.0.0.1:"+strconv.Itoa(f.Port), "127.0.0.1:"+strconv.Itoa(f.Port), false); err != nil {
-			pf.l.WithError(err).Warnf("failed to setting up forward TCP port %d (negligible if already forwarded)", f.Port)
-		} else {
-			pf.tcp[f.Port] = struct{}{}
+		local, remote := pf.forwardingAddresses(f)
+		if local == "" {
+			if !pf.ignore {
+				logrus.Infof("Not forwarding TCP %s", remote)
+			}
+			continue
+		}
+		logrus.Infof("Forwarding TCP from %s to %s", remote, local)
+		if err := forwardTCP(ctx, pf.sshConfig, pf.sshHostPort, local, remote, verbForward); err != nil {
+			logrus.WithError(err).Warnf("failed to set up forwarding tcp port %d (negligible if already forwarded)", f.Port)
 		}
 	}
 }
