@@ -3,109 +3,508 @@ name: test
 on:
   push:
     branches:
-      - master
-      - 'release/**'
+    - master
+    - 'release/**'
+    paths-ignore:
+    - "docs/**"
+    - "website/**"
+    - "**.md"
   pull_request:
+    paths-ignore:
+    - "docs/**"
+    - "website/**"
+    - "**.md"
+env:
+  LIMACTL_CREATE_ARGS: ""
+
+permissions: read-all
 
 jobs:
-  golangci-lint:
-    runs-on: ubuntu-20.04
-    timeout-minutes: 20
+  lints:
+    name: "Lints"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v2
-        with:
-          version: v1.35
-          args: --verbose
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        # To avoid "failed to load YAML file \"templates/experimental/riscv64.yaml\": can't parse builtin Lima version \"3f3a6f6\": 3f3a6f6 is not in dotted-tri format"
+        fetch-depth: 0
+    - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34  # v5.3.0
+      with:
+        go-version: 1.24.x
+    - name: Install protoc
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+    - name: Verify generated files
+      run: make install-tools generate check-generated
+    - name: Run golangci-lint
+      uses: golangci/golangci-lint-action@2226d7cb06a077cd73e56eedd38eecad18e5d837  # v6.5.0
+      with:
+        version: v1.64.2
+        args: --verbose --timeout=10m
+    - name: Run yamllint
+      run: yamllint .
+    - name: Install shellcheck
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y shellcheck
+    - name: Run file and directory name linter
+      uses: ls-lint/action@1887e6c0e7f2dfa81a2d67591f0eb7782720026f  # v2.2.3
+    - name: Run shellcheck
+      run: find . -name '*.sh' | xargs shellcheck
+    - name: Install shfmt
+      run: go install mvdan.cc/sh/v3/cmd/shfmt@v3.4.3
+    - name: Run shfmt
+      run: find . -name '*.sh' | xargs shfmt -s -d
+    - name: Check hyperlinks
+      uses: docker://dkhamsing/awesome_bot:latest@sha256:a8adaeb3b3bd5745304743e4d8a6d512127646e420544a6d22d9f58a07f35884
+      with:
+        args: /github/workspace/README.md --allow-dupe --allow-redirect --request-delay 1 --white-list https://img.shields.io,http://127.0.0.1:8080,https://github.com/lima-vm/lima/releases/download,https://xbarapp.com,https://api.github.com
+    - name: Install go-licenses
+      run: go install github.com/google/go-licenses@v1.6.0
+    - name: Check licenses
+      # the allow list corresponds to https://github.com/cncf/foundation/blob/e5db022a0009f4db52b89d9875640cf3137153fe/allowed-third-party-license-policy.md
+      run: go-licenses check --include_tests  ./... --allowed_licenses=Apache-2.0,BSD-2-Clause,BSD-2-Clause-FreeBSD,BSD-3-Clause,MIT,ISC,Python-2.0,PostgreSQL,X11,Zlib
 
-  basic:
-    name: Basic tests
-    runs-on: ${{ matrix.os }}
+  security:
+    name: "Vulncheck"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+    - uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee  # v1.0.4
+
+  spell:
+    name: "Spell check"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        fetch-depth: 1
+    - uses: codespell-project/actions-codespell@406322ec52dd7b488e48c1c4b82e2a8b3a1bf630  # v2.1
+      with:
+        check_filenames: true
+        check_hidden: true
+        # by default, codespell uses configuration from the .codespellrc
+
+  unit:
+    name: "Unit tests"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # For non-Homebrew we have to support an old release of Go
+        go-version: ["1.23.x", "1.24.x"]
+    steps:
+    - name: Install test dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends qemu-utils
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        fetch-depth: 1
+    - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34  # v5.3.0
+      with:
+        go-version: ${{ matrix.go-version }}
+    - name: Unit tests
+      run: go test -v ./...
+    - name: Make
+      run: make
+    - name: Install
+      run: sudo make install
+    - name: Verify templates match `limactl edit` format
+      run: |
+        find templates -name '*.yaml' -exec limactl edit --set 'del(.nothing)' {} \;
+        git diff-index --exit-code HEAD
+    - name: Uninstall
+      run: sudo make uninstall
+
+  windows:
+    name: "Windows tests"
+    runs-on: windows-2022-8-cores
+    timeout-minutes: 30
+    steps:
+    - name: Enable WSL2
+      run: |
+        wsl --set-default-version 2
+        # Manually install the latest kernel from MSI
+        Invoke-WebRequest -Uri "https://wslstorestorage.blob.core.windows.net/wslblob/wsl_update_x64.msi" -OutFile "wsl_update_x64.msi"
+        $pwd = (pwd).Path
+        Start-Process msiexec.exe -Wait -ArgumentList "/I $pwd\wsl_update_x64.msi /quiet"
+        wsl --update
+        wsl --status
+        wsl --list --online
+    - name: Install WSL2 distro
+      timeout-minutes: 1
+      run: |
+        # FIXME: At least one distro has to be installed here,
+        # otherwise `wsl --list --verbose` (called from Lima) fails:
+        # https://github.com/lima-vm/lima/pull/1826#issuecomment-1729993334
+        # The distro image itself is not consumed by Lima.
+        # ------------------------------------------------------------------
+        wsl --import dummy $env:TEMP nul
+        wsl --list --verbose
+    - name: Set gitconfig
+      run: |
+        git config --global core.autocrlf false
+        git config --global core.eol lf
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        fetch-depth: 1
+    - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34  # v5.3.0
+      with:
+        go-version: 1.24.x
+    - name: Unit tests
+      run: go test -v ./...
+    - name: Make
+      run: make
+# FIXME: Windows CI began to fail on Oct 21, 2024.
+# Something seems to have changed between win22/20241006.1 and win22/20241015.1.
+# https://github.com/lima-vm/lima/issues/2775
+#    - name: Smoke test
+#      # Make sure the path is set properly and then run limactl
+#      run: |
+#        $env:Path = 'C:\Program Files\Git\usr\bin;' + $env:Path
+#        Set-ItemProperty -Path 'Registry::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Control\Session Manager\Environment' -Name PATH -Value $env:Path
+#        .\_output\bin\limactl.exe start template://experimental/wsl2
+#      # TODO: run the full integration tests
+#    - name: Debug
+#      if: always()
+#      run: type C:\Users\runneradmin\.lima\wsl2\ha.stdout.log
+#    - name: Debug
+#      if: always()
+#      run: type C:\Users\runneradmin\.lima\wsl2\ha.stderr.log
+
+  qemu:
+    name: "Integration tests (QEMU, macOS host)"
+    runs-on: macos-15-large  # Intel
+    timeout-minutes: 120
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        # To avoid "failed to load YAML file \"templates/experimental/riscv64.yaml\": can't parse builtin Lima version \"3f3a6f6\": 3f3a6f6 is not in dotted-tri format"
+        fetch-depth: 0
+    - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34  # v5.3.0
+      with:
+        go-version: 1.24.x
+    - name: Unit tests
+      run: go test -v ./...
+    - name: Make
+      run: make
+    - name: Install
+      run: make install
+    - name: Validate jsonschema
+      run: make schema-limayaml.json
+    - name: Validate templates
+      run: find -L templates -name '*.yaml' | xargs limactl validate
+    - name: Install test dependencies
+      # QEMU:      required by Lima itself
+      # bash:      required by test-templates.sh (OS version of bash is too old)
+      # coreutils: required by test-templates.sh for the "timeout" command
+      # curl:      required by test-templates.sh to download nerdctl for alpine
+      # jq:        required by test-templates.sh to determine download URL for nerdctl
+      run: brew install qemu bash coreutils curl jq
+    - name: "Adjust LIMACTL_CREATE_ARGS"
+      run: echo "LIMACTL_CREATE_ARGS=${LIMACTL_CREATE_ARGS} --vm-type=qemu" >>$GITHUB_ENV
+    - name: "Inject `no_timer_check` to kernel cmdline"
+      # workaround to https://github.com/lima-vm/lima/issues/84
+      run: ./hack/inject-cmdline-to-template.sh templates/default.yaml no_timer_check
+    - name: Cache image used by default.yaml
+      uses: ./.github/actions/setup_cache_for_template
+      with:
+        template: templates/default.yaml
+    - name: "Show cache"
+      run: ./hack/debug-cache.sh
+    - name: "Test default.yaml"
+      uses: nick-fields/retry@c97818ca39074beaea45180dba704f92496a0082  # v3.0.1
+      with:
+        timeout_minutes: 30
+        retry_on: error
+        max_attempts: 3
+        command: ./hack/test-templates.sh templates/default.yaml
+    # GHA macOS is slow and flaky, so we only test default.yaml here.
+    # Other yamls are tested on Linux instances.
+    #
+    - if: always()
+      uses: ./.github/actions/upload_failure_logs_if_exists
+    - name: "Show cache"
+      if: always()
+      run: ./hack/debug-cache.sh
+
+  # Non-default templates are tested on Linux instances of GHA,
+  # as they seem more stable than macOS instances.
+  qemu-linux:
+    name: "Integration tests (QEMU, Linux host)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # Most templates use 9p as the mount type
+        template:
+        - alpine.yaml
+        - debian.yaml  # reverse-sshfs
+        - fedora.yaml
+        - archlinux.yaml
+        - opensuse.yaml
+        - docker.yaml
+        - ../hack/test-templates/alpine-iso-9p-writable.yaml  # Covers alpine-iso.yaml
+        - ../hack/test-templates/net-user-v2.yaml
+        - ../hack/test-templates/test-misc.yaml  # TODO: merge net-user-v2 into test-misc
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        fetch-depth: 1
+    - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34  # v5.3.0
+      with:
+        go-version: 1.24.x
+    - name: Make
+      run: make
+    - name: Install
+      run: sudo make install
+    - name: Cache image used by templates/${{ matrix.template }}
+      uses: ./.github/actions/setup_cache_for_template
+      with:
+        template: templates/${{ matrix.template }}
+    - name: Install test dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends ovmf qemu-system-x86 qemu-utils
+        sudo modprobe kvm
+        # `sudo usermod -aG kvm $(whoami)` does not take an effect on GHA
+        sudo chown $(whoami) /dev/kvm
+    - name: Install ansible-playbook
+      run: |
+        sudo apt-get install -y --no-install-recommends ansible
+      if: matrix.template == '../hack/test-templates/test-misc.yaml'
+    - name: "Show cache"
+      run: ./hack/debug-cache.sh
+    - name: "Test"
+      uses: nick-fields/retry@c97818ca39074beaea45180dba704f92496a0082  # v3.0.1
+      with:
+        timeout_minutes: 30
+        retry_on: error
+        max_attempts: 3
+        command: ./hack/test-templates.sh templates/${{ matrix.template }}
+    - if: always()
+      uses: ./.github/actions/upload_failure_logs_if_exists
+      with:
+        suffix: ${{ matrix.template }}
+    - name: "Show cache"
+      run: ./hack/debug-cache.sh
+
+  colima:
+    name: "Colima tests (QEMU, Linux host)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     strategy:
       matrix:
-        os: [macos-10.15, ubuntu-20.04]
-    timeout-minutes: 20
+        colima-version: ["v0.6.5"]
     steps:
-      - uses: actions/setup-go@v2
-        with:
-          go-version: 1.16.x
-      - uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Unit tests
-        run: go test -v ./...
-      - name: Make
-        run: make
-      - name: Install
-        run: sudo make install
-      - name: Validate examples
-        run: limactl validate ./examples/*.yaml
-      - name: Uninstall
-        run: sudo make uninstall
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        # fetch-depth is set to 0 to let `limactl --version` print semver-ish version
+        fetch-depth: 0
+        ref: ${{ github.event.pull_request.head.sha }}
+    - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34  # v5.3.0
+      with:
+        go-version: 1.24.x
+    - uses: actions/cache@0c907a75c2c80ebcb7f088228285e798b750cf8f  # v4.2.1
+      with:
+        path: ~/.cache/lima/download
+        key: ${{ runner.os }}-colima-${{ matrix.colima-version }}
+    - name: Make
+      run: make
+    - name: Install
+      run: sudo make install
+    - name: Install colima
+      run: |
+        git clone https://github.com/abiosoft/colima
+        cd colima
+        git checkout ${{ matrix.colima-version }}
+        make
+        sudo make install
+    - name: Install test dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends ovmf qemu-system-x86 qemu-utils
+        sudo modprobe kvm
+        # `sudo usermod -aG kvm $(whoami)` does not take an effect on GHA
+        sudo chown $(whoami) /dev/kvm
+    - name: "Show cache"
+      run: ./hack/debug-cache.sh
+    - name: "Test"
+      uses: nick-fields/retry@c97818ca39074beaea45180dba704f92496a0082  # v3.0.1
+      with:
+        timeout_minutes: 30
+        retry_on: error
+        max_attempts: 3
+        command: ./hack/test-colima.sh
+    - name: "Show cache"
+      run: ./hack/debug-cache.sh
 
-  integration:
-    name: Integration tests
-    runs-on: macos-10.15
-    timeout-minutes: 40
+  vmnet:
+    name: "VMNet tests (QEMU)"
+    runs-on: macos-15-large  # Intel
+    timeout-minutes: 120
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        fetch-depth: 1
+    - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34  # v5.3.0
+      with:
+        go-version: 1.24.x
+    - name: Make
+      run: make
+    - name: Install
+      run: make install
+    - name: "Adjust LIMACTL_CREATE_ARGS"
+      run: echo "LIMACTL_CREATE_ARGS=${LIMACTL_CREATE_ARGS} --vm-type=qemu --network=lima:shared" >>$GITHUB_ENV
+    - name: "Inject `no_timer_check` to kernel cmdline"
+      # workaround to https://github.com/lima-vm/lima/issues/84
+      run: ./hack/inject-cmdline-to-template.sh templates/default.yaml no_timer_check
+    - name: Cache image used by default .yaml
+      uses: ./.github/actions/setup_cache_for_template
+      with:
+        template: templates/default.yaml
+    - name: Install test dependencies
+      run: brew install qemu bash coreutils
+    - name: Install socket_vmnet
+      env:
+        SOCKET_VMNET_VERSION: v1.2.0
+      run: |
+        (
+          cd ~
+          git clone https://github.com/lima-vm/socket_vmnet
+          cd socket_vmnet
+          git checkout $SOCKET_VMNET_VERSION
+          sudo git config --global --add safe.directory /Users/runner/socket_vmnet
+          sudo make PREFIX=/opt/socket_vmnet install
+        )
+        limactl sudoers | sudo tee /etc/sudoers.d/lima
+    - name: Unit test (pkg/networks) with socket_vmnet
+      # Set -count=1 to disable cache
+      run: go test -v -count=1 ./pkg/networks/...
+    - name: Test socket_vmnet
+      uses: nick-fields/retry@c97818ca39074beaea45180dba704f92496a0082  # v3.0.1
+      with:
+        timeout_minutes: 30
+        retry_on: error
+        max_attempts: 3
+        command: ./hack/test-templates.sh templates/default.yaml
+    - if: always()
+      uses: ./.github/actions/upload_failure_logs_if_exists
+
+  upgrade:
+    name: "Upgrade tests (QEMU, macOS host)"
+    runs-on: macos-15-large  # Intel
+    timeout-minutes: 120
     strategy:
       matrix:
-        example: [default.yaml, alpine.yaml, debian.yaml, fedora.yaml]
+        oldver: ["v0.15.1"]  # The default VM type was always QEMU until Lima v1.0
     steps:
-      - uses: actions/setup-go@v2
-        with:
-          go-version: 1.16.x
-      - uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Make
-        run: make
-      - name: Install
-        run: make install
-      - name: Install libslirp v4.5.0 explicitly (v4.6.0 is broken)
-        # Workaround until https://gitlab.freedesktop.org/slirp/libslirp/-/issues/48 gets fixed
-        # and packaged in homebrew
-        run: |
-          cd /tmp
-          wget https://raw.githubusercontent.com/Homebrew/homebrew-core/f2a53ffe2362d2a7e55fd1a8a9bc71c1ec15bb00/Formula/libslirp.rb
-          brew install ./libslirp.rb
-          rm -f libslirp.rb
-      - name: Install test dependencies
-        # QEMU:      required by Lima itself
-        # bash:      required by test-example.sh (OS version of bash is too old)
-        # coreutils: required by test-example.sh for the "timeout" command
-        run: brew install qemu bash coreutils
-      - name: Prepare ssh
-        run: |
-          if [ -e ~/.ssh/id_rsa ]; then
-            echo "~/.ssh/id_rsa already exists"
-          else
-            echo "Generating ~/.ssh/id_rsa"
-            ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
-          fi
-      - name: Cache ~/Library/Caches/lima/download
-        uses: actions/cache@v2
-        with:
-          path: ~/Library/Caches/lima/download
-          key: ${{ runner.os }}-examples/${{ matrix.example }}
-      - name: Test
-        env:
-          EXAMPLE: ${{ matrix.example }}
-        run: ./hack/test-example.sh examples/$EXAMPLE
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        fetch-depth: 0
+    - name: Fetch homebrew-core commit messages
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        # needed by ./hack/brew-install-version.sh
+        repository: homebrew/homebrew-core
+        path: homebrew-core
+        fetch-depth: 0
+        filter: tree:0
+    - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34  # v5.3.0
+      with:
+        go-version: 1.24.x
+    - name: Cache image used by ${{ matrix.oldver }}/examples/ubuntu-lts.yaml
+      uses: ./.github/actions/setup_cache_for_template
+      with:
+        template: https://raw.githubusercontent.com/lima-vm/lima/${{ matrix.oldver }}/examples/ubuntu-lts.yaml
+    - name: Install test dependencies
+      run: |
+        brew install bash coreutils
+        # QEMU 9.1.0 seems to break on GitHub runners, both on Monterey and Ventura
+        # We revert back to 8.2.1, which seems to work fine
+        ./hack/brew-install-version.sh qemu 8.2.1
+    - name: Test
+      uses: nick-fields/retry@c97818ca39074beaea45180dba704f92496a0082  # v3.0.1
+      with:
+        timeout_minutes: 30
+        retry_on: error
+        max_attempts: 3
+        command: ./hack/test-upgrade.sh ${{ matrix.oldver }} ${{ github.sha }}
+    - if: always()
+      uses: ./.github/actions/upload_failure_logs_if_exists
 
-  artifacts:
-    name: Artifacts
-    # the release pipeline uses Linux, so we Linux here as well
-    runs-on: ubuntu-20.04
-    timeout-minutes: 20
+  vz:
+    name: "Integration tests (vz)"
+    runs-on: macos-15-large  # Intel
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - {template: default.yaml, ssh-port-forwarder: true}  # SSH port forwarder is currently still the default
+        - {template: fedora.yaml, ssh-port-forwarder: false}  # gRPC port forwarder will become default in the future
     steps:
-      - uses: actions/setup-go@v2
-        with:
-          go-version: 1.16.x
-      - uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Make artifacts
-        run: make artifacts
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        fetch-depth: 1
+    - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34  # v5.3.0
+      with:
+        go-version: 1.24.x
+    - name: Make
+      run: make
+    - name: Install
+      run: make install
+    - name: Cache image used by templates/${{ matrix.template }}
+      uses: ./.github/actions/setup_cache_for_template
+      with:
+        template: templates/${{ matrix.template }}
+    - name: Install test dependencies
+      run: brew install bash coreutils jq
+    - name: Uninstall qemu
+      run: brew uninstall --ignore-dependencies --force qemu
+    - name: Test
+      run: ./hack/test-templates.sh templates/${{ matrix.template }}
+      env:
+        LIMA_SSH_PORT_FORWARDER: ${{ matrix.ssh-port-forwarder }}
+    - if: failure()
+      uses: ./.github/actions/upload_failure_logs_if_exists
+      with:
+        suffix: ${{ matrix.template }}
+
+  # gomodjail is a library sandbox for Go
+  # https://github.com/AkihiroSuda/gomodjail
+  #
+  # This is an early experiment.
+  # CI failures that only occurs with gomodjail shall not block merging PRs.
+  gomodjail:
+    name: "gomodjail (experimental; failures shall not block merging PRs)"
+    runs-on: macos-15-large  # Intel
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        fetch-depth: 1
+    - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34  # v5.3.0
+      with:
+        go-version: 1.24.x
+    - name: Install gomodjail
+      run: |
+        set -eux -o pipefail
+        git clone https://github.com/AkihiroSuda/gomodjail
+        cd gomodjail
+        make binaries install
+    - name: Install Lima
+      # gomodjail depends on symbols
+      run: make KEEP_SYMBOLS=1 binaries install
+    - name: Cache image used by templates/default.yaml
+      uses: ./.github/actions/setup_cache_for_template
+      with:
+        template: templates/default.yaml
+    - name: Smoke test
+      run: gomodjail run --go-mod=./go.mod -- limactl start --tty=false

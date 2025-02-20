@@ -1,373 +1,807 @@
 package hostagent
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	guestagentapi "github.com/AkihiroSuda/lima/pkg/guestagent/api"
-	guestagentclient "github.com/AkihiroSuda/lima/pkg/guestagent/api/client"
-	hostagentapi "github.com/AkihiroSuda/lima/pkg/hostagent/api"
-	"github.com/AkihiroSuda/lima/pkg/limayaml"
-	"github.com/AkihiroSuda/lima/pkg/qemu"
-	"github.com/AkihiroSuda/lima/pkg/sshutil"
-	"github.com/AkihiroSuda/lima/pkg/store"
-	"github.com/AkihiroSuda/lima/pkg/store/filenames"
-	"github.com/AkihiroSuda/sshocker/pkg/ssh"
-	"github.com/digitalocean/go-qemu/qmp"
-	"github.com/digitalocean/go-qemu/qmp/raw"
-	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/lima-vm/lima/pkg/cidata"
+	"github.com/lima-vm/lima/pkg/driver"
+	"github.com/lima-vm/lima/pkg/driverutil"
+	"github.com/lima-vm/lima/pkg/freeport"
+	guestagentapi "github.com/lima-vm/lima/pkg/guestagent/api"
+	guestagentclient "github.com/lima-vm/lima/pkg/guestagent/api/client"
+	hostagentapi "github.com/lima-vm/lima/pkg/hostagent/api"
+	"github.com/lima-vm/lima/pkg/hostagent/dns"
+	"github.com/lima-vm/lima/pkg/hostagent/events"
+	"github.com/lima-vm/lima/pkg/identifierutil"
+	"github.com/lima-vm/lima/pkg/limayaml"
+	"github.com/lima-vm/lima/pkg/networks"
+	"github.com/lima-vm/lima/pkg/osutil"
+	"github.com/lima-vm/lima/pkg/portfwd"
+	"github.com/lima-vm/lima/pkg/sshutil"
+	"github.com/lima-vm/lima/pkg/store"
+	"github.com/lima-vm/lima/pkg/store/filenames"
+	"github.com/lima-vm/sshocker/pkg/ssh"
+	"github.com/sethvargo/go-password/password"
 	"github.com/sirupsen/logrus"
 )
 
 type HostAgent struct {
-	l             *logrus.Logger
-	y             *limayaml.LimaYAML
-	instDir       string
-	sshConfig     *ssh.SSHConfig
-	portForwarder *portForwarder
-	onClose       []func() error // LIFO
+	instConfig        *limayaml.LimaYAML
+	sshLocalPort      int
+	udpDNSLocalPort   int
+	tcpDNSLocalPort   int
+	instDir           string
+	instName          string
+	instSSHAddress    string
+	sshConfig         *ssh.SSHConfig
+	portForwarder     *portForwarder
+	grpcPortForwarder *portfwd.Forwarder
 
-	qExe     string
-	qArgs    []string
-	sigintCh chan os.Signal
+	onClose []func() error // LIFO
+
+	driver   driver.Driver
+	signalCh chan os.Signal
 
 	eventEnc   *json.Encoder
 	eventEncMu sync.Mutex
+
+	vSockPort  int
+	virtioPort string
+
+	clientMu sync.RWMutex
+	client   *guestagentclient.GuestAgentClient
+
+	guestAgentAliveCh     chan struct{} // closed on establishing the connection
+	guestAgentAliveChOnce sync.Once
+}
+
+type options struct {
+	nerdctlArchive string // local path, not URL
+}
+
+type Opt func(*options) error
+
+func WithNerdctlArchive(s string) Opt {
+	return func(o *options) error {
+		o.nerdctlArchive = s
+		return nil
+	}
 }
 
 // New creates the HostAgent.
 //
 // stdout is for emitting JSON lines of Events.
-// stderr is for printing human-readable logs.
-func New(instName string, stdout, stderr io.Writer, sigintCh chan os.Signal) (*HostAgent, error) {
-	l := &logrus.Logger{
-		Out:       stderr,
-		Formatter: new(logrus.JSONFormatter),
-		Hooks:     make(logrus.LevelHooks),
-		Level:     logrus.DebugLevel,
+func New(instName string, stdout io.Writer, signalCh chan os.Signal, opts ...Opt) (*HostAgent, error) {
+	var o options
+	for _, f := range opts {
+		if err := f(&o); err != nil {
+			return nil, err
+		}
 	}
-
 	inst, err := store.Inspect(instName)
 	if err != nil {
 		return nil, err
 	}
 
-	y, err := inst.LoadYAML()
+	// inst.Config is loaded with FillDefault() already, so no need to care about nil pointers.
+	sshLocalPort, err := determineSSHLocalPort(*inst.Config.SSH.LocalPort, instName)
 	if err != nil {
 		return nil, err
 	}
-
-	qCfg := qemu.Config{
-		Name:        instName,
-		InstanceDir: inst.Dir,
-		LimaYAML:    y,
+	if *inst.Config.VMType == limayaml.WSL2 {
+		sshLocalPort = inst.SSHLocalPort
 	}
-	qExe, qArgs, err := qemu.Cmdline(qCfg)
-	if err != nil {
+
+	var udpDNSLocalPort, tcpDNSLocalPort int
+	if *inst.Config.HostResolver.Enabled {
+		udpDNSLocalPort, err = freeport.UDP()
+		if err != nil {
+			return nil, err
+		}
+		tcpDNSLocalPort, err = freeport.TCP()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	vSockPort := 0
+	virtioPort := ""
+	if *inst.Config.VMType == limayaml.VZ {
+		vSockPort = 2222
+	} else if *inst.Config.VMType == limayaml.WSL2 {
+		port, err := freeport.VSock()
+		if err != nil {
+			logrus.WithError(err).Error("failed to get free VSock port")
+		}
+		vSockPort = port
+	} else if *inst.Config.VMType == limayaml.QEMU {
+		// virtserialport doesn't seem to work reliably: https://github.com/lima-vm/lima/issues/2064
+		virtioPort = "" // filenames.VirtioPort
+	}
+
+	if err := cidata.GenerateCloudConfig(inst.Dir, instName, inst.Config); err != nil {
+		return nil, err
+	}
+	if err := cidata.GenerateISO9660(inst.Dir, instName, inst.Config, udpDNSLocalPort, tcpDNSLocalPort, o.nerdctlArchive, vSockPort, virtioPort); err != nil {
 		return nil, err
 	}
 
-	sshArgs, err := sshutil.SSHArgs(inst.Dir)
+	sshOpts, err := sshutil.SSHOpts(
+		"ssh",
+		inst.Dir,
+		*inst.Config.User.Name,
+		*inst.Config.SSH.LoadDotSSHPubKeys,
+		*inst.Config.SSH.ForwardAgent,
+		*inst.Config.SSH.ForwardX11,
+		*inst.Config.SSH.ForwardX11Trusted)
 	if err != nil {
+		return nil, err
+	}
+	if err = writeSSHConfigFile("ssh", inst.Name, inst.Dir, inst.SSHAddress, sshLocalPort, sshOpts); err != nil {
 		return nil, err
 	}
 	sshConfig := &ssh.SSHConfig{
-		AdditionalArgs: sshArgs,
+		AdditionalArgs: sshutil.SSHArgsFromOpts(sshOpts),
 	}
 
+	ignoreTCP := false
+	ignoreUDP := false
+	for _, rule := range inst.Config.PortForwards {
+		if rule.Ignore && rule.GuestPortRange[0] == 1 && rule.GuestPortRange[1] == 65535 {
+			switch rule.Proto {
+			case limayaml.ProtoTCP:
+				ignoreTCP = true
+				logrus.Info("TCP port forwarding is disabled (except for SSH)")
+			case limayaml.ProtoUDP:
+				ignoreUDP = true
+				logrus.Info("UDP port forwarding is disabled")
+			case limayaml.ProtoAny:
+				ignoreTCP = true
+				ignoreUDP = true
+				logrus.Info("TCP (except for SSH) and UDP port forwarding is disabled")
+			}
+		} else {
+			break
+		}
+	}
+	rules := make([]limayaml.PortForward, 0, 3+len(inst.Config.PortForwards))
+	// Block ports 22 and sshLocalPort on all IPs
+	for _, port := range []int{sshGuestPort, sshLocalPort} {
+		rule := limayaml.PortForward{GuestIP: net.IPv4zero, GuestPort: port, Ignore: true}
+		limayaml.FillPortForwardDefaults(&rule, inst.Dir, inst.Config.User, inst.Param)
+		rules = append(rules, rule)
+	}
+	rules = append(rules, inst.Config.PortForwards...)
+	// Default forwards for all non-privileged ports from "127.0.0.1" and "::1"
+	rule := limayaml.PortForward{}
+	limayaml.FillPortForwardDefaults(&rule, inst.Dir, inst.Config.User, inst.Param)
+	rules = append(rules, rule)
+
+	limaDriver := driverutil.CreateTargetDriverInstance(&driver.BaseDriver{
+		Instance:     inst,
+		SSHLocalPort: sshLocalPort,
+		VSockPort:    vSockPort,
+		VirtioPort:   virtioPort,
+	})
+
 	a := &HostAgent{
-		l:             l,
-		y:             y,
-		instDir:       inst.Dir,
-		sshConfig:     sshConfig,
-		portForwarder: newPortForwarder(l, sshConfig, y.SSH.LocalPort),
-		qExe:          qExe,
-		qArgs:         qArgs,
-		sigintCh:      sigintCh,
-		eventEnc:      json.NewEncoder(stdout),
+		instConfig:        inst.Config,
+		sshLocalPort:      sshLocalPort,
+		udpDNSLocalPort:   udpDNSLocalPort,
+		tcpDNSLocalPort:   tcpDNSLocalPort,
+		instDir:           inst.Dir,
+		instName:          instName,
+		instSSHAddress:    inst.SSHAddress,
+		sshConfig:         sshConfig,
+		portForwarder:     newPortForwarder(sshConfig, sshLocalPort, rules, ignoreTCP, inst.VMType),
+		grpcPortForwarder: portfwd.NewPortForwarder(rules, ignoreTCP, ignoreUDP),
+		driver:            limaDriver,
+		signalCh:          signalCh,
+		eventEnc:          json.NewEncoder(stdout),
+		vSockPort:         vSockPort,
+		virtioPort:        virtioPort,
+		guestAgentAliveCh: make(chan struct{}),
 	}
 	return a, nil
 }
 
-func (a *HostAgent) emitEvent(ctx context.Context, ev hostagentapi.Event) {
+func writeSSHConfigFile(sshPath, instName, instDir, instSSHAddress string, sshLocalPort int, sshOpts []string) error {
+	if instDir == "" {
+		return fmt.Errorf("directory is unknown for the instance %q", instName)
+	}
+	var b bytes.Buffer
+	if _, err := fmt.Fprintf(&b, `# This SSH config file can be passed to 'ssh -F'.
+# This file is created by Lima, but not used by Lima itself currently.
+# Modifications to this file will be lost on restarting the Lima instance.
+`); err != nil {
+		return err
+	}
+	if err := sshutil.Format(&b, sshPath, instName, sshutil.FormatConfig,
+		append(sshOpts,
+			fmt.Sprintf("Hostname=%s", instSSHAddress),
+			fmt.Sprintf("Port=%d", sshLocalPort),
+		)); err != nil {
+		return err
+	}
+	fileName := filepath.Join(instDir, filenames.SSHConfig)
+	return os.WriteFile(fileName, b.Bytes(), 0o600)
+}
+
+func determineSSHLocalPort(confLocalPort int, instName string) (int, error) {
+	if confLocalPort > 0 {
+		return confLocalPort, nil
+	}
+	if confLocalPort < 0 {
+		return 0, fmt.Errorf("invalid ssh local port %d", confLocalPort)
+	}
+	if instName == "default" {
+		// use hard-coded value for "default" instance, for backward compatibility
+		return 60022, nil
+	}
+	sshLocalPort, err := freeport.TCP()
+	if err != nil {
+		return 0, fmt.Errorf("failed to find a free port, try setting `ssh.localPort` manually: %w", err)
+	}
+	return sshLocalPort, nil
+}
+
+func (a *HostAgent) emitEvent(_ context.Context, ev events.Event) {
 	a.eventEncMu.Lock()
 	defer a.eventEncMu.Unlock()
 	if ev.Time.IsZero() {
 		ev.Time = time.Now()
 	}
 	if err := a.eventEnc.Encode(ev); err != nil {
-		a.l.WithField("event", ev).WithError(err).Error("failed to emit an event")
+		logrus.WithField("event", ev).WithError(err).Error("failed to emit an event")
 	}
 }
 
-func logPipeRoutine(l *logrus.Logger, r io.Reader, header string) {
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		line := scanner.Text()
-		l.Debugf("%s: %s", header, line)
-	}
+func generatePassword(length int) (string, error) {
+	// avoid any special symbols, to make it easier to copy/paste
+	return password.Generate(length, length/4, 0, false, false)
 }
 
 func (a *HostAgent) Run(ctx context.Context) error {
 	defer func() {
-		exitingEv := hostagentapi.Event{
-			Status: hostagentapi.Status{
+		exitingEv := events.Event{
+			Status: events.Status{
 				Exiting: true,
 			},
 		}
 		a.emitEvent(ctx, exitingEv)
 	}()
+	adjustNofileRlimit()
 
-	qCmd := exec.CommandContext(ctx, a.qExe, a.qArgs...)
-	qStdout, err := qCmd.StdoutPipe()
+	if limayaml.FirstUsernetIndex(a.instConfig) == -1 && *a.instConfig.HostResolver.Enabled {
+		hosts := a.instConfig.HostResolver.Hosts
+		hosts["host.lima.internal"] = networks.SlirpGateway
+		hostname := identifierutil.HostnameFromInstName(a.instName) // TODO: support customization
+		hosts[hostname] = networks.SlirpIPAddress
+		srvOpts := dns.ServerOptions{
+			UDPPort: a.udpDNSLocalPort,
+			TCPPort: a.tcpDNSLocalPort,
+			Address: "127.0.0.1",
+			HandlerOptions: dns.HandlerOptions{
+				IPv6:        *a.instConfig.HostResolver.IPv6,
+				StaticHosts: hosts,
+			},
+		}
+		dnsServer, err := dns.Start(srvOpts)
+		if err != nil {
+			return fmt.Errorf("cannot start DNS server: %w", err)
+		}
+		defer dnsServer.Shutdown()
+	}
+
+	errCh, err := a.driver.Start(ctx)
 	if err != nil {
 		return err
 	}
-	defer logPipeRoutine(a.l, qStdout, "qemu[stdout]")
-	qStderr, err := qCmd.StderrPipe()
-	if err != nil {
-		return err
-	}
-	defer logPipeRoutine(a.l, qStderr, "qemu[stderr]")
 
-	a.l.Infof("Starting QEMU (hint: to watch the boot progress, see %q)", filepath.Join(a.instDir, filenames.SerialLog))
-	a.l.Debugf("qCmd.Args: %v", qCmd.Args)
-	if err := qCmd.Start(); err != nil {
-		return err
+	// WSL instance SSH address isn't known until after VM start
+	if *a.instConfig.VMType == limayaml.WSL2 {
+		sshAddr, err := store.GetSSHAddress(a.instName)
+		if err != nil {
+			return err
+		}
+		a.instSSHAddress = sshAddr
 	}
-	qWaitCh := make(chan error)
-	go func() {
-		qWaitCh <- qCmd.Wait()
-	}()
 
-	sshLocalPort := a.y.SSH.LocalPort // TODO: support dynamic port
-	if sshLocalPort < 0 {
-		return errors.Errorf("invalid ssh local port %d", sshLocalPort)
+	if a.instConfig.Video.Display != nil && *a.instConfig.Video.Display == "vnc" {
+		vncdisplay, vncoptions, _ := strings.Cut(*a.instConfig.Video.VNC.Display, ",")
+		vnchost, vncnum, err := net.SplitHostPort(vncdisplay)
+		if err != nil {
+			return err
+		}
+		n, err := strconv.Atoi(vncnum)
+		if err != nil {
+			return err
+		}
+		vncport := strconv.Itoa(5900 + n)
+		vncpwdfile := filepath.Join(a.instDir, filenames.VNCPasswordFile)
+		vncpasswd, err := generatePassword(8)
+		if err != nil {
+			return err
+		}
+		if err := a.driver.ChangeDisplayPassword(ctx, vncpasswd); err != nil {
+			return err
+		}
+		if err := os.WriteFile(vncpwdfile, []byte(vncpasswd), 0o600); err != nil {
+			return err
+		}
+		if strings.Contains(vncoptions, "to=") {
+			vncport, err = a.driver.GetDisplayConnection(ctx)
+			if err != nil {
+				return err
+			}
+			p, err := strconv.Atoi(vncport)
+			if err != nil {
+				return err
+			}
+			vncnum = strconv.Itoa(p - 5900)
+			vncdisplay = net.JoinHostPort(vnchost, vncnum)
+		}
+		vncfile := filepath.Join(a.instDir, filenames.VNCDisplayFile)
+		if err := os.WriteFile(vncfile, []byte(vncdisplay), 0o600); err != nil {
+			return err
+		}
+		vncurl := "vnc://" + net.JoinHostPort(vnchost, vncport)
+		logrus.Infof("VNC server running at %s <%s>", vncdisplay, vncurl)
+		logrus.Infof("VNC Display: `%s`", vncfile)
+		logrus.Infof("VNC Password: `%s`", vncpwdfile)
 	}
-	stBase := hostagentapi.Status{
-		SSHLocalPort: sshLocalPort,
+
+	if a.driver.CanRunGUI() {
+		go func() {
+			err = a.startRoutinesAndWait(ctx, errCh)
+			if err != nil {
+				logrus.Error(err)
+			}
+		}()
+		return a.driver.RunGUI()
+	}
+	return a.startRoutinesAndWait(ctx, errCh)
+}
+
+func (a *HostAgent) startRoutinesAndWait(ctx context.Context, errCh <-chan error) error {
+	stBase := events.Status{
+		SSHLocalPort: a.sshLocalPort,
 	}
 	stBooting := stBase
-	a.emitEvent(ctx, hostagentapi.Event{Status: stBooting})
-	sshFixCmd := exec.Command("ssh-keygen",
-		"-R", fmt.Sprintf("[127.0.0.1]:%d", sshLocalPort),
-		"-R", fmt.Sprintf("[localhost]:%d", sshLocalPort),
-	)
-	if out, err := sshFixCmd.CombinedOutput(); err != nil {
-		return errors.Wrapf(err, "failed to run %v: %q", sshFixCmd.Args, string(out))
-	}
-
+	a.emitEvent(ctx, events.Event{Status: stBooting})
+	ctxHA, cancelHA := context.WithCancel(ctx)
 	go func() {
 		stRunning := stBase
-		if haErr := a.startHostAgentRoutines(ctx); haErr != nil {
+		if haErr := a.startHostAgentRoutines(ctxHA); haErr != nil {
 			stRunning.Degraded = true
 			stRunning.Errors = append(stRunning.Errors, haErr.Error())
 		}
 		stRunning.Running = true
-		a.emitEvent(ctx, hostagentapi.Event{Status: stRunning})
+		a.emitEvent(ctx, events.Event{Status: stRunning})
 	}()
-
 	for {
 		select {
-		case <-a.sigintCh:
-			a.l.Info("Received SIGINT, shutting down the host agent")
+		case driverErr := <-errCh:
+			logrus.Infof("Driver stopped due to error: %q", driverErr)
+			cancelHA()
 			if closeErr := a.close(); closeErr != nil {
-				a.l.WithError(closeErr).Warn("an error during shutting down the host agent")
+				logrus.WithError(closeErr).Warn("an error during shutting down the host agent")
 			}
-			return a.shutdownQEMU(ctx, 3*time.Minute, qCmd, qWaitCh)
-		case qWaitErr := <-qWaitCh:
-			a.l.WithError(qWaitErr).Info("QEMU has exited")
-			return qWaitErr
+			err := a.driver.Stop(ctx)
+			return err
+		case sig := <-a.signalCh:
+			logrus.Infof("Received %s, shutting down the host agent", osutil.SignalName(sig))
+			cancelHA()
+			if closeErr := a.close(); closeErr != nil {
+				logrus.WithError(closeErr).Warn("an error during shutting down the host agent")
+			}
+			err := a.driver.Stop(ctx)
+			return err
 		}
 	}
 }
 
-func (a *HostAgent) shutdownQEMU(ctx context.Context, timeout time.Duration, qCmd *exec.Cmd, qWaitCh <-chan error) error {
-	a.l.Info("Shutting down QEMU with ACPI")
-	qmpSockPath := filepath.Join(a.instDir, filenames.QMPSock)
-	qmpClient, err := qmp.NewSocketMonitor("unix", qmpSockPath, 5*time.Second)
-	if err != nil {
-		a.l.WithError(err).Warnf("failed to open the QMP socket %q, forcibly killing QEMU", qmpSockPath)
-		return a.killQEMU(ctx, timeout, qCmd, qWaitCh)
+func (a *HostAgent) Info(_ context.Context) (*hostagentapi.Info, error) {
+	info := &hostagentapi.Info{
+		SSHLocalPort: a.sshLocalPort,
 	}
-	if err := qmpClient.Connect(); err != nil {
-		a.l.WithError(err).Warnf("failed to connect to the QMP socket %q, forcibly killing QEMU", qmpSockPath)
-		return a.killQEMU(ctx, timeout, qCmd, qWaitCh)
-	}
-	defer func() { _ = qmpClient.Disconnect() }()
-	rawClient := raw.NewMonitor(qmpClient)
-	a.l.Info("Sending QMP system_powerdown command")
-	if err := rawClient.SystemPowerdown(); err != nil {
-		a.l.WithError(err).Warnf("failed to send system_powerdown command via the QMP socket %q, forcibly killing QEMU", qmpSockPath)
-		return a.killQEMU(ctx, timeout, qCmd, qWaitCh)
-	}
-	deadline := time.After(timeout)
-	select {
-	case qWaitErr := <-qWaitCh:
-		a.l.WithError(qWaitErr).Info("QEMU has exited")
-		return qWaitErr
-	case <-deadline:
-	}
-	a.l.Warnf("QEMU did not exit in %v, forcibly killing QEMU", timeout)
-	return a.killQEMU(ctx, timeout, qCmd, qWaitCh)
-}
-
-func (a *HostAgent) killQEMU(ctx context.Context, timeout time.Duration, qCmd *exec.Cmd, qWaitCh <-chan error) error {
-	if killErr := qCmd.Process.Kill(); killErr != nil {
-		a.l.WithError(killErr).Warn("failed to kill QEMU")
-	}
-	qWaitErr := <-qWaitCh
-	a.l.WithError(qWaitErr).Info("QEMU has exited, after killing forcibly")
-	qemuPIDPath := filepath.Join(a.instDir, filenames.QemuPID)
-	_ = os.RemoveAll(qemuPIDPath)
-	return qWaitErr
+	return info, nil
 }
 
 func (a *HostAgent) startHostAgentRoutines(ctx context.Context) error {
+	if *a.instConfig.Plain {
+		logrus.Info("Running in plain mode. Mounts, port forwarding, containerd, etc. will be ignored. Guest agent will not be running.")
+	}
 	a.onClose = append(a.onClose, func() error {
-		a.l.Debugf("shutting down the SSH master")
-		if exitMasterErr := ssh.ExitMaster("127.0.0.1", a.y.SSH.LocalPort, a.sshConfig); exitMasterErr != nil {
-			a.l.WithError(exitMasterErr).Warn("failed to exit SSH master")
+		logrus.Debugf("shutting down the SSH master")
+		if exitMasterErr := ssh.ExitMaster(a.instSSHAddress, a.sshLocalPort, a.sshConfig); exitMasterErr != nil {
+			logrus.WithError(exitMasterErr).Warn("failed to exit SSH master")
 		}
 		return nil
 	})
-	var mErr error
-	if err := a.waitForRequirements(ctx, "essential", a.essentialRequirements()); err != nil {
-		mErr = multierror.Append(mErr, err)
+	var errs []error
+	if err := a.waitForRequirements("essential", a.essentialRequirements()); err != nil {
+		errs = append(errs, err)
 	}
-	mounts, err := a.setupMounts(ctx)
-	if err != nil {
-		mErr = multierror.Append(mErr, err)
+	if *a.instConfig.SSH.ForwardAgent {
+		faScript := `#!/bin/bash
+set -eux -o pipefail
+sudo mkdir -p -m 700 /run/host-services
+sudo ln -sf "${SSH_AUTH_SOCK}" /run/host-services/ssh-auth.sock
+sudo chown -R "${USER}" /run/host-services`
+		faDesc := "linking ssh auth socket to static location /run/host-services/ssh-auth.sock"
+		stdout, stderr, err := ssh.ExecuteScript(a.instSSHAddress, a.sshLocalPort, a.sshConfig, faScript, faDesc)
+		logrus.Debugf("stdout=%q, stderr=%q, err=%v", stdout, stderr, err)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("stdout=%q, stderr=%q: %w", stdout, stderr, err))
+		}
+	}
+	if *a.instConfig.MountType == limayaml.REVSSHFS && !*a.instConfig.Plain {
+		mounts, err := a.setupMounts()
+		if err != nil {
+			errs = append(errs, err)
+		}
+		a.onClose = append(a.onClose, func() error {
+			var unmountErrs []error
+			for _, m := range mounts {
+				if unmountErr := m.close(); unmountErr != nil {
+					unmountErrs = append(unmountErrs, unmountErr)
+				}
+			}
+			return errors.Join(unmountErrs...)
+		})
+	}
+	if len(a.instConfig.AdditionalDisks) > 0 {
+		a.onClose = append(a.onClose, func() error {
+			var unlockErrs []error
+			for _, d := range a.instConfig.AdditionalDisks {
+				disk, inspectErr := store.InspectDisk(d.Name)
+				if inspectErr != nil {
+					unlockErrs = append(unlockErrs, inspectErr)
+					continue
+				}
+				logrus.Infof("Unmounting disk %q", disk.Name)
+				if unlockErr := disk.Unlock(); unlockErr != nil {
+					unlockErrs = append(unlockErrs, unlockErr)
+				}
+			}
+			return errors.Join(unlockErrs...)
+		})
+	}
+	if !*a.instConfig.Plain {
+		go a.watchGuestAgentEvents(ctx)
+	}
+	if err := a.waitForRequirements("optional", a.optionalRequirements()); err != nil {
+		errs = append(errs, err)
+	}
+	if !*a.instConfig.Plain {
+		logrus.Info("Waiting for the guest agent to be running")
+		select {
+		case <-a.guestAgentAliveCh:
+			// NOP
+		case <-time.After(time.Minute):
+			errs = append(errs, errors.New("guest agent does not seem to be running; port forwards will not work"))
+		}
+	}
+	if err := a.waitForRequirements("final", a.finalRequirements()); err != nil {
+		errs = append(errs, err)
+	}
+	// Copy all config files _after_ the requirements are done
+	for _, rule := range a.instConfig.CopyToHost {
+		if err := copyToHost(ctx, a.sshConfig, a.sshLocalPort, rule.HostFile, rule.GuestFile); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	a.onClose = append(a.onClose, func() error {
-		var unmountMErr error
-		for _, m := range mounts {
-			if unmountErr := m.close(); unmountErr != nil {
-				unmountMErr = multierror.Append(unmountMErr, unmountErr)
+		var rmErrs []error
+		for _, rule := range a.instConfig.CopyToHost {
+			if rule.DeleteOnStop {
+				logrus.Infof("Deleting %s", rule.HostFile)
+				if err := os.RemoveAll(rule.HostFile); err != nil {
+					rmErrs = append(rmErrs, err)
+				}
 			}
 		}
-		return unmountMErr
+		return errors.Join(rmErrs...)
 	})
-	go a.watchGuestAgentEvents(ctx)
-	if err := a.waitForRequirements(ctx, "optional", a.optionalRequirements()); err != nil {
-		mErr = multierror.Append(mErr, err)
-	}
-	return mErr
+	return errors.Join(errs...)
 }
 
 func (a *HostAgent) close() error {
-	a.l.Infof("Shutting down the host agent")
-	var mErr error
+	logrus.Infof("Shutting down the host agent")
+	var errs []error
 	for i := len(a.onClose) - 1; i >= 0; i-- {
 		f := a.onClose[i]
 		if err := f(); err != nil {
-			mErr = multierror.Append(mErr, err)
+			errs = append(errs, err)
 		}
 	}
-	return mErr
+	return errors.Join(errs...)
 }
 
 func (a *HostAgent) watchGuestAgentEvents(ctx context.Context) {
 	// TODO: use vSock (when QEMU for macOS gets support for vSock)
 
-	localUnix := filepath.Join(a.instDir, filenames.GuestAgentSock)
-	// guest should have same UID as the host (specified in cidata)
-	remoteUnix := fmt.Sprintf("/run/user/%d/lima-guestagent.sock", os.Getuid())
-
-	for {
-		if !isGuestAgentSocketAccessible(ctx, localUnix) {
-			if err := os.RemoveAll(localUnix); err != nil {
-				a.l.WithError(err).Warnf("failed to clean up %q (host) before setting up forwarding", localUnix)
-			}
-			a.l.Infof("Forwarding %q (guest) to %q (host)", remoteUnix, localUnix)
-			if err := forwardSSH(ctx, a.sshConfig, a.y.SSH.LocalPort, localUnix, remoteUnix, false); err != nil {
-				a.l.WithError(err).Warnf("failed to setting up forward from %q (guest) to %q (host)", remoteUnix, localUnix)
+	// Setup all socket forwards and defer their teardown
+	if *a.instConfig.VMType != limayaml.WSL2 {
+		logrus.Debugf("Forwarding unix sockets")
+		for _, rule := range a.instConfig.PortForwards {
+			if rule.GuestSocket != "" {
+				local := hostAddress(rule, &guestagentapi.IPPort{})
+				_ = forwardSSH(ctx, a.sshConfig, a.sshLocalPort, local, rule.GuestSocket, verbForward, rule.Reverse)
 			}
 		}
-		if err := a.processGuestAgentEvents(ctx, localUnix); err != nil {
-			a.l.WithError(err).Warn("connection to the guest agent was closed unexpectedly")
+	}
+
+	localUnix := filepath.Join(a.instDir, filenames.GuestAgentSock)
+	remoteUnix := "/run/lima-guestagent.sock"
+
+	a.onClose = append(a.onClose, func() error {
+		logrus.Debugf("Stop forwarding unix sockets")
+		var errs []error
+		for _, rule := range a.instConfig.PortForwards {
+			if rule.GuestSocket != "" {
+				local := hostAddress(rule, &guestagentapi.IPPort{})
+				// using ctx.Background() because ctx has already been cancelled
+				if err := forwardSSH(context.Background(), a.sshConfig, a.sshLocalPort, local, rule.GuestSocket, verbCancel, rule.Reverse); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+		if a.driver.ForwardGuestAgent() {
+			if err := forwardSSH(context.Background(), a.sshConfig, a.sshLocalPort, localUnix, remoteUnix, verbCancel, false); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
+	})
+
+	go func() {
+		if a.instConfig.MountInotify != nil && *a.instConfig.MountInotify {
+			if a.client == nil || !isGuestAgentSocketAccessible(ctx, a.client) {
+				if a.driver.ForwardGuestAgent() {
+					_ = forwardSSH(ctx, a.sshConfig, a.sshLocalPort, localUnix, remoteUnix, verbForward, false)
+				}
+			}
+			err := a.startInotify(ctx)
+			if err != nil {
+				logrus.WithError(err).Warn("failed to start inotify")
+			}
+		}
+	}()
+
+	for {
+		if a.client == nil || !isGuestAgentSocketAccessible(ctx, a.client) {
+			if a.driver.ForwardGuestAgent() {
+				_ = forwardSSH(ctx, a.sshConfig, a.sshLocalPort, localUnix, remoteUnix, verbForward, false)
+			}
+		}
+		client, err := a.getOrCreateClient(ctx)
+		if err == nil {
+			if err := a.processGuestAgentEvents(ctx, client); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					logrus.WithError(err).Warn("guest agent events closed unexpectedly")
+				}
+			}
+		} else {
+			if !strings.Contains(err.Error(), context.Canceled.Error()) {
+				logrus.WithError(err).Warn("connection to the guest agent was closed unexpectedly")
+			}
 		}
 		select {
 		case <-ctx.Done():
-			a.l.Infof("Stopping forwarding %q to %q", remoteUnix, localUnix)
-			verbCancel := true
-			if err := forwardSSH(ctx, a.sshConfig, a.y.SSH.LocalPort, localUnix, remoteUnix, verbCancel); err != nil {
-				a.l.WithError(err).Warnf("failed to stop forwarding %q (remote) to %q (local)", remoteUnix, localUnix)
-			}
-			if err := os.RemoveAll(localUnix); err != nil {
-				a.l.WithError(err).Warnf("failed to clean up %q (host) after stopping forwarding", localUnix)
-			}
 			return
 		case <-time.After(10 * time.Second):
 		}
 	}
 }
 
-func isGuestAgentSocketAccessible(ctx context.Context, localUnix string) bool {
-	client, err := guestagentclient.NewGuestAgentClient(localUnix)
-	if err != nil {
-		return false
-	}
-	_, err = client.Info(ctx)
+func isGuestAgentSocketAccessible(ctx context.Context, client *guestagentclient.GuestAgentClient) bool {
+	_, err := client.Info(ctx)
 	return err == nil
 }
 
-func (a *HostAgent) processGuestAgentEvents(ctx context.Context, localUnix string) error {
-	client, err := guestagentclient.NewGuestAgentClient(localUnix)
-	if err != nil {
-		return err
+func (a *HostAgent) getOrCreateClient(ctx context.Context) (*guestagentclient.GuestAgentClient, error) {
+	a.clientMu.Lock()
+	defer a.clientMu.Unlock()
+	if a.client != nil && isGuestAgentSocketAccessible(ctx, a.client) {
+		return a.client, nil
 	}
+	var err error
+	a.client, err = guestagentclient.NewGuestAgentClient(a.createConnection)
+	return a.client, err
+}
 
+func (a *HostAgent) createConnection(ctx context.Context) (net.Conn, error) {
+	conn, err := a.driver.GuestAgentConn(ctx)
+	// default to forwarded sock
+	if conn == nil && err == nil {
+		var d net.Dialer
+		conn, err = d.DialContext(ctx, "unix", filepath.Join(a.instDir, filenames.GuestAgentSock))
+	}
+	return conn, err
+}
+
+func (a *HostAgent) processGuestAgentEvents(ctx context.Context, client *guestagentclient.GuestAgentClient) error {
 	info, err := client.Info(ctx)
 	if err != nil {
 		return err
 	}
+	logrus.Info("Guest agent is running")
+	a.guestAgentAliveChOnce.Do(func() {
+		close(a.guestAgentAliveCh)
+	})
 
-	a.l.Debugf("guest agent info: %+v", info)
+	logrus.Debugf("guest agent info: %+v", info)
 
-	onEvent := func(ev guestagentapi.Event) {
-		a.l.Debugf("guest agent event: %+v", ev)
+	onEvent := func(ev *guestagentapi.Event) {
+		logrus.Debugf("guest agent event: %+v", ev)
 		for _, f := range ev.Errors {
-			a.l.Warnf("received error from the guest: %q", f)
+			logrus.Warnf("received error from the guest: %q", f)
 		}
-		a.portForwarder.OnEvent(ctx, ev)
+		// useSSHFwd was false by default in v1.0, but reverted to true by default in v1.0.1
+		// due to stability issues
+		useSSHFwd := true
+		if envVar := os.Getenv("LIMA_SSH_PORT_FORWARDER"); envVar != "" {
+			b, err := strconv.ParseBool(os.Getenv("LIMA_SSH_PORT_FORWARDER"))
+			if err != nil {
+				logrus.WithError(err).Warnf("invalid LIMA_SSH_PORT_FORWARDER value %q", envVar)
+			} else {
+				useSSHFwd = b
+			}
+		}
+		if useSSHFwd {
+			a.portForwarder.OnEvent(ctx, ev)
+		} else {
+			a.grpcPortForwarder.OnEvent(ctx, client, ev)
+		}
 	}
 
 	if err := client.Events(ctx, onEvent); err != nil {
+		if status.Code(err) == codes.Canceled {
+			return context.Canceled
+		}
 		return err
 	}
 	return io.EOF
 }
 
-func forwardSSH(ctx context.Context, sshConfig *ssh.SSHConfig, port int, local, remote string, cancel bool) error {
+const (
+	verbForward = "forward"
+	verbCancel  = "cancel"
+)
+
+func executeSSH(ctx context.Context, sshConfig *ssh.SSHConfig, port int, command ...string) error {
 	args := sshConfig.Args()
-	verb := "forward"
-	if cancel {
-		verb = "cancel"
+	args = append(args,
+		"-p", strconv.Itoa(port),
+		"127.0.0.1",
+		"--",
+	)
+	args = append(args, command...)
+	cmd := exec.CommandContext(ctx, sshConfig.Binary(), args...)
+	if out, err := cmd.Output(); err != nil {
+		return fmt.Errorf("failed to run %v: %q: %w", cmd.Args, string(out), err)
 	}
+	return nil
+}
+
+func forwardSSH(ctx context.Context, sshConfig *ssh.SSHConfig, port int, local, remote, verb string, reverse bool) error {
+	args := sshConfig.Args()
 	args = append(args,
 		"-T",
 		"-O", verb,
-		"-L", local+":"+remote,
+	)
+	if reverse {
+		args = append(args,
+			"-R", remote+":"+local,
+		)
+	} else {
+		args = append(args,
+			"-L", local+":"+remote,
+		)
+	}
+	args = append(args,
 		"-N",
 		"-f",
 		"-p", strconv.Itoa(port),
 		"127.0.0.1",
 		"--",
 	)
+	if strings.HasPrefix(local, "/") {
+		switch verb {
+		case verbForward:
+			if reverse {
+				logrus.Infof("Forwarding %q (host) to %q (guest)", local, remote)
+				if err := executeSSH(ctx, sshConfig, port, "rm", "-f", remote); err != nil {
+					logrus.WithError(err).Warnf("Failed to clean up %q (guest) before setting up forwarding", remote)
+				}
+			} else {
+				logrus.Infof("Forwarding %q (guest) to %q (host)", remote, local)
+				if err := os.RemoveAll(local); err != nil {
+					logrus.WithError(err).Warnf("Failed to clean up %q (host) before setting up forwarding", local)
+				}
+			}
+			if err := os.MkdirAll(filepath.Dir(local), 0o750); err != nil {
+				return fmt.Errorf("can't create directory for local socket %q: %w", local, err)
+			}
+		case verbCancel:
+			if reverse {
+				logrus.Infof("Stopping forwarding %q (host) to %q (guest)", local, remote)
+				if err := executeSSH(ctx, sshConfig, port, "rm", "-f", remote); err != nil {
+					logrus.WithError(err).Warnf("Failed to clean up %q (guest) after stopping forwarding", remote)
+				}
+			} else {
+				logrus.Infof("Stopping forwarding %q (guest) to %q (host)", remote, local)
+				defer func() {
+					if err := os.RemoveAll(local); err != nil {
+						logrus.WithError(err).Warnf("Failed to clean up %q (host) after stopping forwarding", local)
+					}
+				}()
+			}
+		default:
+			panic(fmt.Errorf("invalid verb %q", verb))
+		}
+	}
 	cmd := exec.CommandContext(ctx, sshConfig.Binary(), args...)
 	if out, err := cmd.Output(); err != nil {
-		return errors.Wrapf(err, "failed to run %v: %q", cmd.Args, string(out))
+		if verb == verbForward && strings.HasPrefix(local, "/") {
+			if reverse {
+				logrus.WithError(err).Warnf("Failed to set up forward from %q (host) to %q (guest)", local, remote)
+				if err := executeSSH(ctx, sshConfig, port, "rm", "-f", remote); err != nil {
+					logrus.WithError(err).Warnf("Failed to clean up %q (guest) after forwarding failed", remote)
+				}
+			} else {
+				logrus.WithError(err).Warnf("Failed to set up forward from %q (guest) to %q (host)", remote, local)
+				if removeErr := os.RemoveAll(local); removeErr != nil {
+					logrus.WithError(removeErr).Warnf("Failed to clean up %q (host) after forwarding failed", local)
+				}
+			}
+		}
+		return fmt.Errorf("failed to run %v: %q: %w", cmd.Args, string(out), err)
+	}
+	return nil
+}
+
+func copyToHost(ctx context.Context, sshConfig *ssh.SSHConfig, port int, local, remote string) error {
+	args := sshConfig.Args()
+	args = append(args,
+		"-p", strconv.Itoa(port),
+		"127.0.0.1",
+		"--",
+	)
+	args = append(args,
+		"sudo",
+		"cat",
+		remote,
+	)
+	logrus.Infof("Copying config from %s to %s", remote, local)
+	if err := os.MkdirAll(filepath.Dir(local), 0o700); err != nil {
+		return fmt.Errorf("can't create directory for local file %q: %w", local, err)
+	}
+	cmd := exec.CommandContext(ctx, sshConfig.Binary(), args...)
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to run %v: %q: %w", cmd.Args, string(out), err)
+	}
+	if err := os.WriteFile(local, out, 0o600); err != nil {
+		return fmt.Errorf("can't write to local file %q: %w", local, err)
 	}
 	return nil
 }

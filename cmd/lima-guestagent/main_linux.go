@@ -1,44 +1,38 @@
 package main
 
 import (
-	"errors"
-	"os"
 	"strings"
 
-	"github.com/AkihiroSuda/lima/pkg/version"
+	"github.com/lima-vm/lima/pkg/debugutil"
+	"github.com/lima-vm/lima/pkg/version"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli/v2"
+	"github.com/spf13/cobra"
 )
 
 func main() {
-	if err := newApp().Run(os.Args); err != nil {
+	if err := newApp().Execute(); err != nil {
 		logrus.Fatal(err)
 	}
 }
 
-func newApp() *cli.App {
-	app := cli.NewApp()
-	app.Name = "lima-guestagent"
-	app.Usage = "Do not launch manually"
-	app.Version = strings.TrimPrefix(version.Version, "v")
-	app.Flags = []cli.Flag{
-		&cli.BoolFlag{
-			Name:  "debug",
-			Usage: "debug mode",
-		},
+func newApp() *cobra.Command {
+	rootCmd := &cobra.Command{
+		Use:     "lima-guestagent",
+		Short:   "Do not launch manually",
+		Version: strings.TrimPrefix(version.Version, "v"),
 	}
-	app.Before = func(clicontext *cli.Context) error {
-		if clicontext.Bool("debug") {
+	rootCmd.PersistentFlags().Bool("debug", false, "debug mode")
+	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
+		debug, _ := cmd.Flags().GetBool("debug")
+		if debug {
 			logrus.SetLevel(logrus.DebugLevel)
-		}
-		if os.Geteuid() == 0 {
-			return errors.New("must not run as the root")
+			debugutil.Debug = true
 		}
 		return nil
 	}
-	app.Commands = []*cli.Command{
-		daemonCommand,
-		installSystemdCommand,
-	}
-	return app
+	rootCmd.AddCommand(
+		newDaemonCommand(),
+		newInstallSystemdCommand(),
+	)
+	return rootCmd
 }

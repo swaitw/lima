@@ -1,36 +1,39 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"runtime"
 
-	"github.com/AkihiroSuda/lima/pkg/store"
-	"github.com/pkg/errors"
+	"github.com/lima-vm/lima/pkg/autostart"
+	"github.com/lima-vm/lima/pkg/instance"
+	networks "github.com/lima-vm/lima/pkg/networks/reconcile"
+	"github.com/lima-vm/lima/pkg/store"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli/v2"
+	"github.com/spf13/cobra"
 )
 
-var deleteCommand = &cli.Command{
-	Name:      "delete",
-	Aliases:   []string{"remove", "rm"},
-	Usage:     "Delete an instance of Lima.",
-	ArgsUsage: "INSTANCE [INSTANCE, ...]",
-	Flags: []cli.Flag{
-		&cli.BoolFlag{
-			Name:    "force",
-			Aliases: []string{"f"},
-			Usage:   "forcibly kill the processes",
-		},
-	},
-	Action:       deleteAction,
-	BashComplete: deleteBashComplete,
+func newDeleteCommand() *cobra.Command {
+	deleteCommand := &cobra.Command{
+		Use:               "delete INSTANCE [INSTANCE, ...]",
+		Aliases:           []string{"remove", "rm"},
+		Short:             "Delete an instance of Lima.",
+		Args:              WrapArgsError(cobra.MinimumNArgs(1)),
+		RunE:              deleteAction,
+		ValidArgsFunction: deleteBashComplete,
+		GroupID:           basicCommand,
+	}
+	deleteCommand.Flags().BoolP("force", "f", false, "forcibly kill the processes")
+	return deleteCommand
 }
 
-func deleteAction(clicontext *cli.Context) error {
-	if clicontext.NArg() == 0 {
-		return errors.Errorf("requires at least 1 argument")
+func deleteAction(cmd *cobra.Command, args []string) error {
+	force, err := cmd.Flags().GetBool("force")
+	if err != nil {
+		return err
 	}
-	force := clicontext.Bool("force")
-	for _, instName := range clicontext.Args().Slice() {
+	for _, instName := range args {
 		inst, err := store.Inspect(instName)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -39,27 +42,22 @@ func deleteAction(clicontext *cli.Context) error {
 			}
 			return err
 		}
-		if err := deleteInstance(inst, force); err != nil {
-			return errors.Wrapf(err, "failed to delete instance %q", instName)
+		if err := instance.Delete(cmd.Context(), inst, force); err != nil {
+			return fmt.Errorf("failed to delete instance %q: %w", instName, err)
+		}
+		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+			deleted, err := autostart.DeleteStartAtLoginEntry(runtime.GOOS, instName)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				logrus.WithError(err).Warnf("The autostart file for instance %q does not exist", instName)
+			} else if deleted {
+				logrus.Infof("The autostart file %q has been deleted", autostart.GetFilePath(runtime.GOOS, instName))
+			}
 		}
 		logrus.Infof("Deleted %q (%q)", instName, inst.Dir)
 	}
-	return nil
+	return networks.Reconcile(cmd.Context(), "")
 }
 
-func deleteInstance(inst *store.Instance, force bool) error {
-	if !force && inst.Status != store.StatusStopped {
-		return errors.Errorf("expected status %q, got %q", store.StatusStopped, inst.Status)
-	}
-
-	stopInstanceForcibly(inst)
-
-	if err := os.RemoveAll(inst.Dir); err != nil {
-		return errors.Wrapf(err, "failed to remove %q", inst.Dir)
-	}
-	return nil
-}
-
-func deleteBashComplete(clicontext *cli.Context) {
-	bashCompleteInstanceNames(clicontext)
+func deleteBashComplete(cmd *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
+	return bashCompleteInstanceNames(cmd)
 }

@@ -3,12 +3,12 @@ package procnettcp
 import (
 	"bufio"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"strings"
-
-	"github.com/pkg/errors"
 )
 
 type Kind = string
@@ -16,7 +16,9 @@ type Kind = string
 const (
 	TCP  Kind = "tcp"
 	TCP6 Kind = "tcp6"
-	// TODO: "udp", "udp6", "udplite", "udplite6"
+	UDP  Kind = "udp"
+	UDP6 Kind = "udp6"
+	// TODO: "udplite", "udplite6".
 )
 
 type State = int
@@ -24,6 +26,7 @@ type State = int
 const (
 	TCPEstablished State = 0x1
 	TCPListen      State = 0xA
+	UDPEstablished State = 0x7
 )
 
 type Entry struct {
@@ -35,9 +38,9 @@ type Entry struct {
 
 func Parse(r io.Reader, kind Kind) ([]Entry, error) {
 	switch kind {
-	case TCP, TCP6:
+	case TCP, TCP6, UDP, UDP6:
 	default:
-		return nil, errors.Errorf("unexpected kind %q", kind)
+		return nil, fmt.Errorf("unexpected kind %q", kind)
 	}
 
 	var entries []Entry
@@ -57,10 +60,10 @@ func Parse(r io.Reader, kind Kind) ([]Entry, error) {
 				fieldNames[fields[j]] = j
 			}
 			if _, ok := fieldNames["local_address"]; !ok {
-				return nil, errors.Errorf("field \"local_address\" not found")
+				return nil, errors.New("field \"local_address\" not found")
 			}
 			if _, ok := fieldNames["st"]; !ok {
-				return nil, errors.Errorf("field \"st\" not found")
+				return nil, errors.New("field \"st\" not found")
 			}
 
 		default:
@@ -106,12 +109,12 @@ func Parse(r io.Reader, kind Kind) ([]Entry, error) {
 func ParseAddress(s string) (net.IP, uint16, error) {
 	split := strings.SplitN(s, ":", 2)
 	if len(split) != 2 {
-		return nil, 0, errors.Errorf("unparsable address %q", s)
+		return nil, 0, fmt.Errorf("unparsable address %q", s)
 	}
 	switch l := len(split[0]); l {
 	case 8, 32:
 	default:
-		return nil, 0, errors.Errorf("unparsable address %q, expected length of %q to be 8 or 32, got %d",
+		return nil, 0, fmt.Errorf("unparsable address %q, expected length of %q to be 8 or 32, got %d",
 			s, split[0], l)
 	}
 
@@ -120,7 +123,7 @@ func ParseAddress(s string) (net.IP, uint16, error) {
 		quartet := split[0][8*i : 8*(i+1)]
 		quartetLE, err := hex.DecodeString(quartet) // surprisingly little endian, per 4 bytes
 		if err != nil {
-			return nil, 0, errors.Wrapf(err, "unparsable address %q: unparsable quartet %q", s, quartet)
+			return nil, 0, fmt.Errorf("unparsable address %q: unparsable quartet %q: %w", s, quartet, err)
 		}
 		for j := 0; j < len(quartetLE); j++ {
 			ipBytes[4*i+len(quartetLE)-1-j] = quartetLE[j]
@@ -130,7 +133,7 @@ func ParseAddress(s string) (net.IP, uint16, error) {
 
 	port64, err := strconv.ParseUint(split[1], 16, 16)
 	if err != nil {
-		return nil, 0, errors.Errorf("unparsable address %q: unparsable port %q", s, split[1])
+		return nil, 0, fmt.Errorf("unparsable address %q: unparsable port %q", s, split[1])
 	}
 	port := uint16(port64)
 

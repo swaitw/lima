@@ -3,53 +3,49 @@ package main
 import (
 	"errors"
 	"net"
-	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
-	"github.com/AkihiroSuda/lima/pkg/guestagent"
-	"github.com/AkihiroSuda/lima/pkg/guestagent/api/server"
-	"github.com/gorilla/mux"
+	"github.com/lima-vm/lima/pkg/guestagent"
+	"github.com/lima-vm/lima/pkg/guestagent/api/server"
+	"github.com/lima-vm/lima/pkg/guestagent/serialport"
+	"github.com/lima-vm/lima/pkg/portfwdserver"
+	"github.com/mdlayher/vsock"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli/v2"
+	"github.com/spf13/cobra"
 )
 
-var daemonCommand = &cli.Command{
-	Name:  "daemon",
-	Usage: "run the daemon",
-	Flags: []cli.Flag{
-		&cli.StringFlag{
-			Name:  "socket",
-			Usage: "socket",
-			Value: func() string {
-				if xrd := os.Getenv("XDG_RUNTIME_DIR"); xrd != "" {
-					return filepath.Join(xrd, "lima-guestagent.sock")
-				}
-				logrus.Warn("$XDG_RUNTIME_DIR is not set, cannot determine the socket name")
-				return ""
-			}(),
-		},
-		&cli.DurationFlag{
-			Name:  "tick",
-			Usage: "tick for polling events",
-			Value: 3 * time.Second,
-		},
-	},
-	Action: daemonAction,
+func newDaemonCommand() *cobra.Command {
+	daemonCommand := &cobra.Command{
+		Use:   "daemon",
+		Short: "run the daemon",
+		RunE:  daemonAction,
+	}
+	daemonCommand.Flags().Duration("tick", 3*time.Second, "tick for polling events")
+	daemonCommand.Flags().Int("vsock-port", 0, "use vsock server instead a UNIX socket")
+	daemonCommand.Flags().String("virtio-port", "", "use virtio server instead a UNIX socket")
+	return daemonCommand
 }
 
-func daemonAction(clicontext *cli.Context) error {
-	socket := clicontext.String("socket")
-	if socket == "" {
-		return errors.New("socket must be specified")
+func daemonAction(cmd *cobra.Command, _ []string) error {
+	socket := "/run/lima-guestagent.sock"
+	tick, err := cmd.Flags().GetDuration("tick")
+	if err != nil {
+		return err
 	}
-	tick := clicontext.Duration("tick")
+	vSockPort, err := cmd.Flags().GetInt("vsock-port")
+	if err != nil {
+		return err
+	}
+	virtioPort, err := cmd.Flags().GetString("virtio-port")
+	if err != nil {
+		return err
+	}
 	if tick == 0 {
 		return errors.New("tick must be specified")
 	}
-	if os.Geteuid() == 0 {
-		return errors.New("must not run as the root")
+	if os.Geteuid() != 0 {
+		return errors.New("must run as the root user")
 	}
 	logrus.Infof("event tick: %v", tick)
 
@@ -61,21 +57,40 @@ func daemonAction(clicontext *cli.Context) error {
 		return ticker.C, ticker.Stop
 	}
 
-	agent := guestagent.New(newTicker)
-	backend := &server.Backend{
-		Agent: agent,
-	}
-	r := mux.NewRouter()
-	server.AddRoutes(r, backend)
-	srv := &http.Server{Handler: r}
-	err := os.RemoveAll(socket)
+	agent, err := guestagent.New(newTicker, tick*20)
 	if err != nil {
 		return err
 	}
-	l, err := net.Listen("unix", socket)
+	err = os.RemoveAll(socket)
 	if err != nil {
 		return err
 	}
-	logrus.Infof("serving the guest agent on %q", socket)
-	return srv.Serve(l)
+
+	var l net.Listener
+	if virtioPort != "" {
+		qemuL, err := serialport.Listen("/dev/virtio-ports/" + virtioPort)
+		if err != nil {
+			return err
+		}
+		l = qemuL
+		logrus.Infof("serving the guest agent on qemu serial file: %s", virtioPort)
+	} else if vSockPort != 0 {
+		vsockL, err := vsock.Listen(uint32(vSockPort), nil)
+		if err != nil {
+			return err
+		}
+		l = vsockL
+		logrus.Infof("serving the guest agent on vsock port: %d", vSockPort)
+	} else {
+		socketL, err := net.Listen("unix", socket)
+		if err != nil {
+			return err
+		}
+		if err := os.Chmod(socket, 0o777); err != nil {
+			return err
+		}
+		l = socketL
+		logrus.Infof("serving the guest agent on %q", socket)
+	}
+	return server.StartServer(l, &server.GuestServer{Agent: agent, TunnelS: portfwdserver.NewTunnelServer()})
 }
